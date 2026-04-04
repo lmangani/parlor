@@ -86,10 +86,33 @@ async def websocket_endpoint(ws: WebSocket):
     )
     conversation.__enter__()
 
+    interrupted = asyncio.Event()
+    msg_queue = asyncio.Queue()
+
+    async def receiver():
+        """Receive messages from WebSocket and route them."""
+        try:
+            while True:
+                raw = await ws.receive_text()
+                msg = json.loads(raw)
+                if msg.get("type") == "interrupt":
+                    interrupted.set()
+                    print("Client interrupted")
+                else:
+                    await msg_queue.put(msg)
+        except WebSocketDisconnect:
+            await msg_queue.put(None)
+
+    recv_task = asyncio.create_task(receiver())
+
     try:
         while True:
-            msg = json.loads(await ws.receive_text())
+            msg = await msg_queue.get()
+            if msg is None:
+                break
+
             audio_path = image_path = None
+            interrupted.clear()
 
             try:
                 if msg.get("audio"):
@@ -122,7 +145,15 @@ async def websocket_endpoint(ws: WebSocket):
                 llm_time = time.time() - t0
                 print(f"LLM ({llm_time:.2f}s): {text_response}")
 
+                if interrupted.is_set():
+                    print("Interrupted after LLM, skipping response")
+                    continue
+
                 await ws.send_text(json.dumps({"type": "text", "text": text_response, "llm_time": round(llm_time, 2)}))
+
+                if interrupted.is_set():
+                    print("Interrupted before TTS, skipping audio")
+                    continue
 
                 # TTS
                 t0 = time.time()
@@ -131,6 +162,10 @@ async def websocket_endpoint(ws: WebSocket):
                 )
                 tts_time = time.time() - t0
                 print(f"TTS ({tts_time:.2f}s): {len(wav_bytes)} bytes")
+
+                if interrupted.is_set():
+                    print("Interrupted after TTS, skipping audio send")
+                    continue
 
                 await ws.send_text(json.dumps({"type": "audio", "audio": base64.b64encode(wav_bytes).decode(), "tts_time": round(tts_time, 2)}))
 
@@ -142,6 +177,7 @@ async def websocket_endpoint(ws: WebSocket):
     except WebSocketDisconnect:
         print("Client disconnected")
     finally:
+        recv_task.cancel()
         conversation.__exit__(None, None, None)
 
 

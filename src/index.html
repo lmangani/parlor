@@ -30,17 +30,6 @@
     max-width: 100%; max-height: 100%;
     border-radius: 12px; background: #111; transform: scaleX(-1);
   }
-  .record-indicator {
-    position: absolute; top: 36px; left: 36px;
-    display: flex; align-items: center; gap: 8px;
-    font-size: 13px; opacity: 0; transition: opacity 0.2s;
-  }
-  .record-indicator.active { opacity: 1; }
-  .record-dot {
-    width: 10px; height: 10px; border-radius: 50%;
-    background: #f87171; animation: pulse 1s infinite;
-  }
-  @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:0.4; } }
 
   .chat-panel { width: 400px; border-left: 1px solid #222; display: flex; flex-direction: column; }
   .messages { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 12px; }
@@ -50,13 +39,22 @@
   .msg .meta { font-size: 11px; color: #666; margin-top: 4px; }
 
   .controls { padding: 16px 24px; border-top: 1px solid #222; display: flex; align-items: center; gap: 12px; }
-  button { padding: 10px 20px; border: none; border-radius: 8px; font-size: 14px; cursor: pointer; font-weight: 500; }
-  #talkBtn { background: #2563eb; color: white; flex: 1; }
-  #talkBtn:hover { background: #1d4ed8; }
-  #talkBtn.recording { background: #dc2626; }
-  #talkBtn:disabled { background: #333; color: #666; cursor: not-allowed; }
-  .toggle { background: #1a1a1a; color: #aaa; padding: 10px 14px; }
+  .toggle { background: #1a1a1a; color: #aaa; padding: 10px 14px; border: none; border-radius: 8px; font-size: 14px; cursor: pointer; font-weight: 500; }
   .toggle.active { background: #1a3a1a; color: #4ade80; }
+
+  .state-indicator {
+    flex: 1; display: flex; align-items: center; justify-content: center; gap: 8px;
+    font-size: 14px; color: #888; height: 40px;
+  }
+  .state-dot {
+    width: 10px; height: 10px; border-radius: 50%;
+    transition: background 0.2s;
+  }
+  .state-dot.listening { background: #4ade80; animation: pulse 2s infinite; }
+  .state-dot.processing { background: #facc15; animation: pulse 0.6s infinite; }
+  .state-dot.speaking { background: #60a5fa; animation: pulse 1s infinite; }
+  .state-dot.loading { background: #666; animation: pulse 1.5s infinite; }
+  @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:0.3; } }
 </style>
 </head>
 <body>
@@ -69,38 +67,73 @@
 <div class="main">
   <div class="video-panel">
     <video id="video" autoplay muted playsinline></video>
-    <div id="recordIndicator" class="record-indicator">
-      <div class="record-dot"></div>
-      <span>Listening...</span>
-    </div>
   </div>
   <div class="chat-panel">
     <div id="messages" class="messages"></div>
     <div class="controls">
-      <button id="talkBtn" disabled>Hold to Talk</button>
+      <div id="stateIndicator" class="state-indicator">
+        <div id="stateDot" class="state-dot loading"></div>
+        <span id="stateText">Loading VAD...</span>
+      </div>
       <button id="cameraToggle" class="toggle active">Camera</button>
     </div>
   </div>
 </div>
 
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/ort.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.29/dist/bundle.min.js"></script>
 <script>
 const $ = id => document.getElementById(id);
-const video = $('video'), talkBtn = $('talkBtn'), cameraToggle = $('cameraToggle');
-const messagesDiv = $('messages'), statusEl = $('status'), recordIndicator = $('recordIndicator');
+const video = $('video'), cameraToggle = $('cameraToggle');
+const messagesDiv = $('messages'), statusEl = $('status');
+const stateDot = $('stateDot'), stateText = $('stateText');
 
-let ws, mediaStream, mediaRecorder, audioChunks = [];
-let isRecording = false, cameraEnabled = true;
+let ws, mediaStream, myvad;
+let cameraEnabled = true;
 let audioCtx, currentSource;
+let state = 'loading'; // loading | listening | processing | speaking
+let ignoreIncomingAudio = false;
+
+// -- State Machine --
+function setState(newState) {
+  state = newState;
+  stateDot.className = `state-dot ${newState}`;
+  const labels = { loading: 'Loading VAD...', listening: 'Listening...', processing: 'Thinking...', speaking: 'Speaking...' };
+  stateText.textContent = labels[newState] || newState;
+
+  // Raise VAD threshold during speaking to reduce echo false triggers
+  if (myvad) {
+    if (newState === 'speaking') {
+      myvad.setOptions({ positiveSpeechThreshold: 0.8 });
+    } else {
+      myvad.setOptions({ positiveSpeechThreshold: 0.5 });
+    }
+  }
+}
 
 // -- WebSocket --
 function connect() {
   ws = new WebSocket(`ws://${location.host}/ws`);
-  ws.onopen = () => { setStatus('connected', 'Connected'); talkBtn.disabled = false; };
-  ws.onclose = () => { setStatus('disconnected', 'Disconnected'); talkBtn.disabled = true; setTimeout(connect, 2000); };
+  ws.onopen = () => {
+    setStatus('connected', 'Connected');
+    if (state !== 'loading') setState('listening');
+  };
+  ws.onclose = () => {
+    setStatus('disconnected', 'Disconnected');
+    setTimeout(connect, 2000);
+  };
   ws.onmessage = ({ data }) => {
     const msg = JSON.parse(data);
-    if (msg.type === 'text') addMessage('assistant', msg.text, `LLM: ${msg.llm_time}s`);
-    else if (msg.type === 'audio') playAudio(msg.audio, msg.tts_time);
+    if (msg.type === 'text') {
+      addMessage('assistant', msg.text, `LLM: ${msg.llm_time}s`);
+    } else if (msg.type === 'audio') {
+      if (ignoreIncomingAudio) {
+        ignoreIncomingAudio = false;
+        setState('listening');
+        return;
+      }
+      playAudio(msg.audio, msg.tts_time);
+    }
   };
 }
 
@@ -110,16 +143,16 @@ function setStatus(cls, text) { statusEl.className = `status ${cls}`; statusEl.t
 async function startCamera() {
   try {
     mediaStream = await navigator.mediaDevices.getUserMedia({
-      video: { width: 640, height: 480, facingMode: 'user' }, audio: true,
+      video: { width: 640, height: 480, facingMode: 'user' },
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
     });
     video.srcObject = mediaStream;
     return;
   } catch (e) { console.warn('Video+audio failed:', e.message); }
 
-  // Try separately
   const streams = await Promise.allSettled([
     navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480, facingMode: 'user' } }),
-    navigator.mediaDevices.getUserMedia({ audio: true }),
+    navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } }),
   ]);
   mediaStream = new MediaStream();
   streams.forEach(r => { if (r.status === 'fulfilled') r.value.getTracks().forEach(t => mediaStream.addTrack(t)); });
@@ -136,82 +169,64 @@ function captureFrame() {
   return canvas.toDataURL('image/jpeg', 0.7).split(',')[1];
 }
 
-// -- Recording --
-function startRecording() {
-  if (!mediaStream || !mediaStream.getAudioTracks().length) return;
-  if (!audioCtx) audioCtx = new AudioContext();
-  if (audioCtx.state === 'suspended') audioCtx.resume();
-
-  audioChunks = [];
-  mediaRecorder = new MediaRecorder(new MediaStream(mediaStream.getAudioTracks()));
-  mediaRecorder.ondataavailable = e => { if (e.data.size > 0) audioChunks.push(e.data); };
-  mediaRecorder.onstop = async () => {
-    const wav = await webmToWavBase64(new Blob(audioChunks, { type: 'audio/webm' }));
-    sendMessage(wav, captureFrame());
-  };
-  mediaRecorder.start(100);
-  isRecording = true;
-  talkBtn.classList.add('recording'); talkBtn.textContent = 'Recording...';
-  recordIndicator.classList.add('active');
-}
-
-function stopRecording() {
-  if (mediaRecorder?.state !== 'inactive') mediaRecorder?.stop();
-  isRecording = false;
-  talkBtn.classList.remove('recording'); talkBtn.textContent = 'Hold to Talk';
-  recordIndicator.classList.remove('active');
-}
-
-async function webmToWavBase64(blob) {
-  const ctx = new OfflineAudioContext(1, 1, 16000);
-  const decoded = await ctx.decodeAudioData(await blob.arrayBuffer());
-  const pcm = decoded.getChannelData(0);
-
-  // Resample to 16kHz if needed
-  let samples = pcm;
-  if (decoded.sampleRate !== 16000) {
-    const ratio = 16000 / decoded.sampleRate;
-    const len = Math.round(pcm.length * ratio);
-    samples = new Float32Array(len);
-    for (let i = 0; i < len; i++) {
-      const src = i / ratio, idx = Math.floor(src), frac = src - idx;
-      samples[i] = idx + 1 < pcm.length ? pcm[idx] * (1 - frac) + pcm[idx + 1] * frac : pcm[idx];
+// -- VAD Handlers --
+function handleSpeechStart() {
+  if (state === 'speaking') {
+    // Barge-in: user is interrupting the AI
+    stopPlayback();
+    ignoreIncomingAudio = true;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'interrupt' }));
     }
+    setState('listening');
+    console.log('Barge-in: interrupted playback');
   }
+}
 
-  // Encode WAV
+function handleSpeechEnd(audio) {
+  if (state !== 'listening') return;
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+  const wavBase64 = float32ToWavBase64(audio);
+  const imageBase64 = captureFrame();
+
+  setState('processing');
+  setStatus('processing', 'Processing...');
+  addMessage('user', '(voice message)', imageBase64 ? 'with camera' : '');
+
+  const payload = { audio: wavBase64 };
+  if (imageBase64) payload.image = imageBase64;
+  ws.send(JSON.stringify(payload));
+}
+
+// -- Float32 @ 16kHz → WAV base64 --
+function float32ToWavBase64(samples) {
   const buf = new ArrayBuffer(44 + samples.length * 2);
   const v = new DataView(buf);
   const w = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
-  w(0,'RIFF'); v.setUint32(4,36+samples.length*2,true); w(8,'WAVE'); w(12,'fmt ');
-  v.setUint32(16,16,true); v.setUint16(20,1,true); v.setUint16(22,1,true);
-  v.setUint32(24,16000,true); v.setUint32(28,32000,true); v.setUint16(32,2,true);
-  v.setUint16(34,16,true); w(36,'data'); v.setUint32(40,samples.length*2,true);
+  w(0,'RIFF'); v.setUint32(4, 36 + samples.length * 2, true); w(8,'WAVE'); w(12,'fmt ');
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+  v.setUint32(24, 16000, true); v.setUint32(28, 32000, true); v.setUint16(32, 2, true);
+  v.setUint16(34, 16, true); w(36,'data'); v.setUint32(40, samples.length * 2, true);
   for (let i = 0; i < samples.length; i++) {
     const s = Math.max(-1, Math.min(1, samples[i]));
     v.setInt16(44 + i * 2, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
   }
-
   const bytes = new Uint8Array(buf);
   let bin = ''; for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
   return btoa(bin);
 }
 
-// -- Send --
-function sendMessage(audioBase64, imageBase64) {
-  if (!ws || ws.readyState !== WebSocket.OPEN) return;
-  setStatus('processing', 'Processing...');
-  talkBtn.disabled = true;
-  const payload = {};
-  if (audioBase64) payload.audio = audioBase64;
-  if (imageBase64) payload.image = imageBase64;
-  addMessage('user', '(voice message)', imageBase64 ? 'with camera' : '');
-  ws.send(JSON.stringify(payload));
+// -- Playback --
+function stopPlayback() {
+  if (currentSource) {
+    try { currentSource.stop(); } catch {}
+    currentSource = null;
+  }
 }
 
-// -- Playback --
 async function playAudio(base64Wav, ttsTime) {
-  if (currentSource) try { currentSource.stop(); } catch {}
+  stopPlayback();
   if (!audioCtx) audioCtx = new AudioContext();
   if (audioCtx.state === 'suspended') await audioCtx.resume();
 
@@ -225,7 +240,15 @@ async function playAudio(base64Wav, ttsTime) {
   source.connect(audioCtx.destination);
   source.start();
   currentSource = source;
-  source.onended = () => { setStatus('connected', 'Connected'); talkBtn.disabled = false; };
+  setState('speaking');
+
+  source.onended = () => {
+    currentSource = null;
+    if (state === 'speaking') {
+      setState('listening');
+      setStatus('connected', 'Connected');
+    }
+  };
 
   const meta = messagesDiv.querySelector('.msg.assistant:last-child .meta');
   if (meta) meta.textContent += ` | TTS: ${ttsTime}s`;
@@ -240,12 +263,6 @@ function addMessage(role, text, meta) {
   messagesDiv.scrollTop = messagesDiv.scrollHeight;
 }
 
-talkBtn.addEventListener('mousedown', startRecording);
-talkBtn.addEventListener('mouseup', stopRecording);
-talkBtn.addEventListener('mouseleave', () => { if (isRecording) stopRecording(); });
-talkBtn.addEventListener('touchstart', e => { e.preventDefault(); startRecording(); });
-talkBtn.addEventListener('touchend', e => { e.preventDefault(); stopRecording(); });
-
 cameraToggle.addEventListener('click', () => {
   cameraEnabled = !cameraEnabled;
   cameraToggle.classList.toggle('active', cameraEnabled);
@@ -253,7 +270,35 @@ cameraToggle.addEventListener('click', () => {
   video.style.opacity = cameraEnabled ? 1 : 0.3;
 });
 
-startCamera().then(connect);
+// -- Init --
+async function init() {
+  await startCamera();
+  connect();
+
+  // Initialize VAD with shared mic stream
+  myvad = await vad.MicVAD.new({
+    getStream: async () => {
+      // Return a stream with only audio tracks for VAD
+      return new MediaStream(mediaStream.getAudioTracks());
+    },
+    positiveSpeechThreshold: 0.5,
+    negativeSpeechThreshold: 0.25,
+    redemptionMs: 600,
+    minSpeechMs: 300,
+    preSpeechPadMs: 300,
+    onSpeechStart: handleSpeechStart,
+    onSpeechEnd: handleSpeechEnd,
+    onVADMisfire: () => { console.log('VAD misfire (too short)'); },
+    onnxWASMBasePath: "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/",
+    baseAssetPath: "https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.29/dist/",
+  });
+
+  myvad.start();
+  setState('listening');
+  console.log('VAD initialized and listening');
+}
+
+init();
 </script>
 </body>
 </html>
