@@ -4,7 +4,7 @@ On-device, real-time multimodal AI. Have natural voice and vision conversations 
 
 Parlor uses [Gemma 4 E2B](https://huggingface.co/google/gemma-4-E2B-it) for understanding speech and vision, and [Kokoro](https://huggingface.co/hexgrad/Kokoro-82M) for text-to-speech. You talk, show your camera, and it talks back, all locally.
 
-https://github.com/user-attachments/assets/placeholder
+https://github.com/user-attachments/assets/cb0ffb2e-f84f-48e7-872c-c5f7b5c6d51f
 
 > **Research preview.** This is an early experiment. Expect rough edges and bugs.
 
