@@ -20,7 +20,12 @@ from fastapi.responses import HTMLResponse
 import litert_lm
 import tts
 import agent_tools
-from tools_policy import ParlorToolPolicy, build_optional_tools, coalesce_respond_to_user_fields
+from tools_policy import (
+    ParlorToolPolicy,
+    build_optional_tools,
+    coalesce_respond_to_user_fields,
+    normalize_respond_to_user_merged_args,
+)
 
 HF_REPO = "litert-community/gemma-4-E2B-it-litert-lm"
 HF_FILENAME = "gemma-4-E2B-it.litertlm"
@@ -297,12 +302,25 @@ async def websocket_endpoint(ws: WebSocket):
         voice_response: str = "",
         answer: str = "",
         spoken: str = "",
+        text: str = "",
+        message: str = "",
+        content: str = "",
+        body: str = "",
+        final_response: str = "",
+        assistant_message: str = "",
+        say: str = "",
+        value: str = "",
         display_context: str = "",
         screen_text: str = "",
         details: str = "",
         notes: str = "",
         context: str = "",
         formatted_context: str = "",
+        markdown: str = "",
+        links: str = "",
+        sources: str = "",
+        urls: str = "",
+        bullets: str = "",
     ) -> str:
         """Deliver the turn: what to speak (TTS) and/or what to show on screen.
 
@@ -310,26 +328,41 @@ async def websocket_endpoint(ws: WebSocket):
         can use alternate argument names; transcription may be omitted.
         """
         tr, r, d = coalesce_respond_to_user_fields(
-            {
-                "transcription": transcription,
-                "transcript": transcript,
-                "user_speech": user_speech,
-                "speech": speech,
-                "user_message": user_message,
-                "what_the_user_said": what_the_user_said,
-                "response": response,
-                "reply": reply,
-                "spoken_response": spoken_response,
-                "voice_response": voice_response,
-                "answer": answer,
-                "spoken": spoken,
-                "display_context": display_context,
-                "screen_text": screen_text,
-                "details": details,
-                "notes": notes,
-                "context": context,
-                "formatted_context": formatted_context,
-            }
+            normalize_respond_to_user_merged_args(
+                {
+                    "transcription": transcription,
+                    "transcript": transcript,
+                    "user_speech": user_speech,
+                    "speech": speech,
+                    "user_message": user_message,
+                    "what_the_user_said": what_the_user_said,
+                    "response": response,
+                    "reply": reply,
+                    "spoken_response": spoken_response,
+                    "voice_response": voice_response,
+                    "answer": answer,
+                    "spoken": spoken,
+                    "text": text,
+                    "message": message,
+                    "content": content,
+                    "body": body,
+                    "final_response": final_response,
+                    "assistant_message": assistant_message,
+                    "say": say,
+                    "value": value,
+                    "display_context": display_context,
+                    "screen_text": screen_text,
+                    "details": details,
+                    "notes": notes,
+                    "context": context,
+                    "formatted_context": formatted_context,
+                    "markdown": markdown,
+                    "links": links,
+                    "sources": sources,
+                    "urls": urls,
+                    "bullets": bullets,
+                }
+            )
         )
         tool_result["transcription"] = tr
         tool_result["response"] = r

@@ -27,6 +27,13 @@ _RESPONSE_KEYS = (
     "voice_response",
     "answer",
     "spoken",
+    "text",
+    "message",
+    "content",
+    "body",
+    "final_response",
+    "assistant_message",
+    "say",
 )
 _DISPLAY_KEYS = (
     "display_context",
@@ -35,7 +42,26 @@ _DISPLAY_KEYS = (
     "notes",
     "context",
     "formatted_context",
+    "markdown",
+    "links",
+    "sources",
+    "urls",
+    "bullets",
 )
+
+_KNOWN_RESPOND_ARG_KEYS = frozenset(
+    _TRANSCRIPTION_KEYS + _RESPONSE_KEYS + _DISPLAY_KEYS + ("value",)
+)
+
+
+def _scalar_to_nonempty_str(v: Any) -> str:
+    if isinstance(v, str):
+        return v.strip()
+    if isinstance(v, bool):
+        return ""
+    if isinstance(v, (int, float)):
+        return str(v).strip()
+    return ""
 
 
 def coalesce_respond_to_user_fields(args: dict[str, Any]) -> tuple[str, str, str]:
@@ -43,16 +69,51 @@ def coalesce_respond_to_user_fields(args: dict[str, Any]) -> tuple[str, str, str
 
     def first_str(keys: tuple[str, ...]) -> str:
         for k in keys:
-            v = args.get(k)
-            if isinstance(v, str) and v.strip():
-                return v.strip()
+            s = _scalar_to_nonempty_str(args.get(k))
+            if s:
+                return s
         return ""
 
-    return (
-        first_str(_TRANSCRIPTION_KEYS),
-        first_str(_RESPONSE_KEYS),
-        first_str(_DISPLAY_KEYS),
-    )
+    tr = first_str(_TRANSCRIPTION_KEYS)
+    r = first_str(_RESPONSE_KEYS)
+    d = first_str(_DISPLAY_KEYS)
+
+    if not r and not d:
+        # Last resort: any unknown string field (models sometimes invent names).
+        candidates: list[tuple[str, str]] = []
+        for k, v in args.items():
+            if k in _KNOWN_RESPOND_ARG_KEYS:
+                continue
+            s = _scalar_to_nonempty_str(v)
+            if len(s) > 8:
+                candidates.append((k, s))
+        candidates.sort(key=lambda x: len(x[1]), reverse=True)
+        if candidates:
+            r = candidates[0][1]
+            if len(candidates) > 1:
+                d = candidates[1][1]
+
+    return (tr, r, d)
+
+
+def normalize_respond_to_user_merged_args(raw: dict[str, Any]) -> dict[str, Any]:
+    """Unwrap LiteRT/Gemma `value=` blobs and JSON tool payloads before coalescing."""
+    a = dict(raw)
+    v = a.get("value")
+    if isinstance(v, str) and v.strip():
+        s = v.strip()
+        try:
+            parsed = json.loads(s)
+            if isinstance(parsed, dict):
+                rest = {k: v2 for k, v2 in a.items() if k != "value"}
+                return {**parsed, **rest}
+        except json.JSONDecodeError:
+            pass
+        probe = {k: v2 for k, v2 in a.items() if k != "value"}
+        tr, r, d = coalesce_respond_to_user_fields(probe)
+        if not r and not d:
+            return {**probe, "response": s}
+    return a
 
 
 def extract_tool_name(tool_call: dict[str, Any]) -> str | None:
@@ -88,6 +149,20 @@ def extract_tool_arguments(tool_call: dict[str, Any]) -> dict[str, Any]:
             pass
     elif isinstance(raw, dict):
         merged.update(raw)
+
+    for key in ("parameters", "params", "input"):
+        sub = tool_call.get(key)
+        if isinstance(sub, dict):
+            merged.update(sub)
+
+    tv = merged.get("value")
+    if isinstance(tv, str) and tv.strip():
+        try:
+            parsed = json.loads(tv.strip())
+            if isinstance(parsed, dict):
+                merged = {**parsed, **merged}
+        except json.JSONDecodeError:
+            pass
 
     return merged
 
@@ -136,6 +211,7 @@ class ParlorToolPolicy(litert_lm.ToolEventHandler):
                 return False
 
         if name == "respond_to_user":
+            args = normalize_respond_to_user_merged_args(args)
             _tr, r, d = coalesce_respond_to_user_fields(args)
             # Transcription is optional: Gemma often omits it or uses other keys; never block the turn.
             has_voice = bool(r)
