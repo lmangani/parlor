@@ -20,7 +20,7 @@ from fastapi.responses import HTMLResponse
 import litert_lm
 import tts
 import agent_tools
-from tools_policy import ParlorToolPolicy, build_optional_tools
+from tools_policy import ParlorToolPolicy, build_optional_tools, coalesce_respond_to_user_fields
 
 HF_REPO = "litert-community/gemma-4-E2B-it-litert-lm"
 HF_FILENAME = "gemma-4-E2B-it.litertlm"
@@ -60,6 +60,7 @@ def _make_web_search_with_memory(memory: dict[str, str]):
         out = agent_tools.web_search(**kwargs)
         if isinstance(out, str) and out.strip():
             q = agent_tools.extract_search_query(kwargs)
+            q = _strip_model_text(q) if q else ""
             memory["query"] = (q or "—")[: agent_tools.MAX_QUERY_LEN]
             memory["text"] = out[:SEARCH_MEMORY_CAP]
         return out
@@ -113,7 +114,8 @@ def build_system_prompt() -> str:
     lines.extend(
         [
             "- respond_to_user: REQUIRED last step every turn. Fields:",
-            "  • transcription: exact words the user said in the audio.",
+            "  • transcription: exact words the user said (optional if unclear—still set response "
+            "and/or display_context).",
             "  • response: what you want spoken (TTS)—short, natural, 1–4 sentences for the ear. "
             "Leave empty when you prefer text-only for this turn: if display_context is non-empty, "
             "no audio is played and the user reads the transcript.",
@@ -283,22 +285,55 @@ async def websocket_endpoint(ws: WebSocket):
     search_memory: dict[str, str] = {"query": "", "text": ""}
 
     def respond_to_user(
-        transcription: str,
+        transcription: str = "",
+        transcript: str = "",
+        user_speech: str = "",
+        speech: str = "",
+        user_message: str = "",
+        what_the_user_said: str = "",
         response: str = "",
+        reply: str = "",
+        spoken_response: str = "",
+        voice_response: str = "",
+        answer: str = "",
+        spoken: str = "",
         display_context: str = "",
+        screen_text: str = "",
+        details: str = "",
+        notes: str = "",
+        context: str = "",
+        formatted_context: str = "",
     ) -> str:
         """Deliver the turn: what to speak (TTS) and/or what to show on screen.
 
-        Args:
-            transcription: Exact transcription of what the user said in the audio.
-            response: Spoken reply (1–4 short sentences for TTS). May be empty if you only
-                want on-screen text; a short bridge line may be spoken instead.
-            display_context: Longer text for the transcript: tool summaries, URLs, bullets,
-                structured notes—shown in parallel with audio so the user can read details.
+        Optional aliases mirror tools_policy.coalesce_respond_to_user_fields so Gemma/LiteRT
+        can use alternate argument names; transcription may be omitted.
         """
-        tool_result["transcription"] = transcription
-        tool_result["response"] = response
-        tool_result["display_context"] = display_context
+        tr, r, d = coalesce_respond_to_user_fields(
+            {
+                "transcription": transcription,
+                "transcript": transcript,
+                "user_speech": user_speech,
+                "speech": speech,
+                "user_message": user_message,
+                "what_the_user_said": what_the_user_said,
+                "response": response,
+                "reply": reply,
+                "spoken_response": spoken_response,
+                "voice_response": voice_response,
+                "answer": answer,
+                "spoken": spoken,
+                "display_context": display_context,
+                "screen_text": screen_text,
+                "details": details,
+                "notes": notes,
+                "context": context,
+                "formatted_context": formatted_context,
+            }
+        )
+        tool_result["transcription"] = tr
+        tool_result["response"] = r
+        tool_result["display_context"] = d
         return "OK"
 
     web_search_impl = (

@@ -12,6 +12,48 @@ from agent_tools import MAX_QUERY_LEN, extract_search_query
 
 MAX_TOOL_RESPONSE_CHARS = 14000
 
+_TRANSCRIPTION_KEYS = (
+    "transcription",
+    "transcript",
+    "user_speech",
+    "speech",
+    "user_message",
+    "what_the_user_said",
+)
+_RESPONSE_KEYS = (
+    "response",
+    "reply",
+    "spoken_response",
+    "voice_response",
+    "answer",
+    "spoken",
+)
+_DISPLAY_KEYS = (
+    "display_context",
+    "screen_text",
+    "details",
+    "notes",
+    "context",
+    "formatted_context",
+)
+
+
+def coalesce_respond_to_user_fields(args: dict[str, Any]) -> tuple[str, str, str]:
+    """Map Gemma / LiteRT variants onto (transcription, response, display_context)."""
+
+    def first_str(keys: tuple[str, ...]) -> str:
+        for k in keys:
+            v = args.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        return ""
+
+    return (
+        first_str(_TRANSCRIPTION_KEYS),
+        first_str(_RESPONSE_KEYS),
+        first_str(_DISPLAY_KEYS),
+    )
+
 
 def extract_tool_name(tool_call: dict[str, Any]) -> str | None:
     if not isinstance(tool_call, dict):
@@ -94,16 +136,15 @@ class ParlorToolPolicy(litert_lm.ToolEventHandler):
                 return False
 
         if name == "respond_to_user":
-            tr = args.get("transcription", "")
-            if not isinstance(tr, str) or not tr.strip():
-                print("respond_to_user denied: missing transcription")
-                return False
-            r = args.get("response", "")
-            d = args.get("display_context", "")
-            has_voice = isinstance(r, str) and bool(r.strip())
-            has_screen = isinstance(d, str) and bool(d.strip())
+            _tr, r, d = coalesce_respond_to_user_fields(args)
+            # Transcription is optional: Gemma often omits it or uses other keys; never block the turn.
+            has_voice = bool(r)
+            has_screen = bool(d)
             if not has_voice and not has_screen:
-                print("respond_to_user denied: need non-empty response and/or display_context")
+                print(
+                    "respond_to_user denied: need non-empty response and/or display_context; keys=",
+                    list(args.keys()),
+                )
                 return False
 
         self._trace.append(name)
