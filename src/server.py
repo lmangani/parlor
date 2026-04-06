@@ -61,10 +61,20 @@ def load_models():
     tts_backend = tts.load()
 
 
+def unload_models():
+    global engine
+    if engine is not None:
+        engine.__exit__(None, None, None)
+
+
 @asynccontextmanager
 async def lifespan(app):
-    await asyncio.get_event_loop().run_in_executor(None, load_models)
-    yield
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, load_models)
+    try:
+        yield
+    finally:
+        await loop.run_in_executor(None, unload_models)
 
 
 app = FastAPI(lifespan=lifespan)
