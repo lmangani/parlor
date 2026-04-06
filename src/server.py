@@ -4,6 +4,7 @@ import asyncio
 import base64
 import functools
 import json
+from json.decoder import JSONDecoder
 import os
 import re
 import tempfile
@@ -119,23 +120,22 @@ def build_system_prompt() -> str:
         )
     lines.extend(
         [
-            "- respond_to_user: REQUIRED last step every turn. It has exactly ONE argument, `turn`: "
-            "a JSON object string (valid JSON). Keys (all optional strings): transcription, response, "
-            "display_context.",
-            "  • response: short text for TTS (1–4 sentences). May be \"\" if display_context has the "
-            "full answer (then the user reads the screen only).",
-            "  • display_context: bullets, URLs, numbered search results—too dense for voice.",
-            "  • transcription: what the user said, if you can infer it; may be \"\".",
-            "  CRITICAL for LiteRT: do NOT use multi-field tool syntax like "
-            "display_context:... ,response:... (easy to omit ':' and crash the parser). "
-            "Only pass turn=<|\"|>{...}<|\"|> with everything inside the JSON.",
-            "  Example turn value (one line if you can): "
-            '{"response":"Here are a few sites for events today.","display_context":"• Eventbrite …\\n• I amsterdam …"}',
-            "  Escape double quotes inside strings as \\\". Use \\\\n for newlines inside JSON strings.",
-            "  Emit exactly ONE respond_to_user call per turn—never duplicate it, never prefix "
-            '"code block:" or paste the call twice.',
-            "  Never put tool markup inside JSON values (no <|tool_call, no call:respond_to_user)—"
-            "only natural language inside the strings.",
+            "- respond_to_user: REQUIRED last step. Use THREE plain string fields (like web_search uses "
+            "plain text in value—NOT JSON). LiteRT wraps each field in <|\"|>…<|\"|>; JSON inside a "
+            "field breaks the parser because quote characters clash with the wrapper.",
+            "  Fields (each optional except you must fill response and/or display_context):",
+            "  • response — short text for TTS (1–4 sentences).",
+            "  • display_context — bullets, URLs, search listings for the on-screen transcript.",
+            "  • transcription — what the user said, if known; else leave empty.",
+            "  SYNTAX (copy the shape exactly): after each field name there must be a colon, then "
+            "<|\"|>, then your text, then <|\"|>, then a comma before the next field name:",
+            "  call:respond_to_user{response:<|\"|>Spoken words here.<|\"|>,display_context:<|\"|>Screen text "
+            "with URLs and bullets.<|\"|>,transcription:<|\"|><|\"|>}",
+            "  Rules: (1) Never write JSON braces { } or JSON quotes around keys inside these fields. "
+            "(2) After every comma the next token must be fieldname:<|\"|> — e.g. "
+            ",display_context:<|\"|> not ,display_context<|\"|>. "
+            "(3) Avoid the ASCII double-quote character inside values; use apostrophes for emphasis. "
+            "(4) Exactly one respond_to_user per turn—no code block: prefix, no duplicated call.",
             "",
         ]
     )
@@ -285,6 +285,41 @@ _LITERT_TOOL_PARSE_MESSAGE = (
 )
 
 
+def _recover_tool_result_from_litert_error(err: str) -> dict[str, str] | None:
+    """When LiteRT fails to parse FC, the error text often includes the raw call. Salvage JSON
+    from broken `turn:<|\"|>{...}` output (model omits closing <|\"|> or lexer chokes on inner quotes).
+    """
+    if "respond_to_user" not in err or "turn:" not in err:
+        return None
+    markers = (
+        "call:respond_to_user{turn:<|\"|>",
+        "respond_to_user{turn:<|\"|>",
+    )
+    for m in markers:
+        idx = err.find(m)
+        if idx < 0:
+            continue
+        sub = err[idx + len(m) :]
+        brace = sub.find("{")
+        if brace < 0:
+            continue
+        dec = JSONDecoder()
+        try:
+            obj, _ = dec.raw_decode(sub, brace)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        flat = normalize_respond_to_user_merged_args(
+            {k: v for k, v in obj.items() if isinstance(v, (str, int, float))}
+        )
+        tr, r, d = coalesce_respond_to_user_fields(flat)
+        if not (r or d):
+            continue
+        return {"transcription": tr, "response": r, "display_context": d}
+    return None
+
+
 @app.get("/")
 async def root():
     return HTMLResponse(content=(Path(__file__).parent / "index.html").read_text())
@@ -299,12 +334,24 @@ async def websocket_endpoint(ws: WebSocket):
     tool_trace: list[str] = []
     search_memory: dict[str, str] = {"query": "", "text": ""}
 
-    def respond_to_user(turn: str = "") -> str:
-        """Single FC argument: JSON with optional transcription, response, display_context.
-
-        Multi-field function-call syntax is fragile in LiteRT; one string blob parses reliably.
-        """
-        args = merge_json_blob_arg({"turn": turn}, ("turn", "payload"))
+    def respond_to_user(
+        response: str = "",
+        display_context: str = "",
+        transcription: str = "",
+        turn: str = "",
+        payload: str = "",
+    ) -> str:
+        """Plain string args; optional turn/payload JSON for legacy model output (expanded in policy)."""
+        args = merge_json_blob_arg(
+            {
+                "response": response,
+                "display_context": display_context,
+                "transcription": transcription,
+                "turn": turn,
+                "payload": payload,
+            },
+            ("turn", "payload"),
+        )
         args = normalize_respond_to_user_merged_args(args)
         tr, r, d = coalesce_respond_to_user_fields(args)
         tool_result["transcription"] = tr
@@ -451,6 +498,18 @@ async def websocket_endpoint(ws: WebSocket):
                 display_ctx = ""
                 transcription = None
                 needs_conversation_reset = False
+                recovered_from_litert_parse = False
+
+                if litert_error is not None:
+                    recovered = _recover_tool_result_from_litert_error(litert_error)
+                    if recovered:
+                        tool_result.update(recovered)
+                        tool_trace.append("respond_to_user(recovered)")
+                        recovered_from_litert_parse = True
+                        print(
+                            f"LLM ({llm_time:.2f}s) [recovered] respond_to_user from LiteRT error text"
+                        )
+                        litert_error = None
 
                 if litert_error is not None:
                     needs_conversation_reset = True
@@ -510,7 +569,7 @@ async def websocket_endpoint(ws: WebSocket):
                                 text_response = _EMPTY_ASSISTANT_RETRY_MESSAGE
                         print(f"LLM ({llm_time:.2f}s) [no tool] raw head: {raw_text[:160]!r}…")
 
-                if needs_conversation_reset:
+                if needs_conversation_reset or recovered_from_litert_parse:
                     reopen_conversation()
 
                 if interrupted.is_set():
