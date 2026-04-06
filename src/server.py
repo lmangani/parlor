@@ -147,6 +147,9 @@ def build_system_prompt() -> str:
         "Gemma 4 E2B: each user turn sends audio and/or image before the text instruction. "
         "Use that order: listen and look first, then read the text.",
         "",
+        "You may use internal chain-of-thought when enabled. Decide whether to call web_search or "
+        "other tools; then always deliver what the user hears via respond_to_user.",
+        "",
         "Work like a good agent: use tools, read results internally, decide what matters, then "
         "choose how much to say aloud vs what to show as text. The user cannot see your raw tool "
         "logs—only what you put in respond_to_user.",
@@ -182,9 +185,8 @@ def build_system_prompt() -> str:
         )
     lines.extend(
         [
-            "- respond_to_user: REQUIRED last step. Use THREE plain string fields (like web_search uses "
-            "plain text in value—NOT JSON). LiteRT wraps each field in <|\"|>…<|\"|>; JSON inside a "
-            "field breaks the parser because quote characters clash with the wrapper.",
+            "- respond_to_user: REQUIRED last step. Three string fields only (keeps tool schema small). "
+            "Plain text in each value—not JSON. LiteRT uses <|\"|>…<|\"|> wrappers; inner \" breaks parsing.",
             "  Fields (each optional except you must fill response and/or display_context):",
             "  • response — what the user hears. For recipes/how-tos this must carry the real answer "
             "(ingredients, steps), not 'here is a link'. Aim for enough spoken detail to be useful.",
@@ -246,7 +248,18 @@ def build_system_prompt() -> str:
     return "\n".join(lines)
 
 
-SYSTEM_PROMPT = build_system_prompt()
+def _thinking_prefixed_system_prompt() -> str:
+    """Gemma 4: optional <|think|> at start of system content enables chain-of-thought (HF model card)."""
+    p = build_system_prompt()
+    raw = os.environ.get("PARLOR_ENABLE_THINKING", "1").strip().lower()
+    if raw in ("0", "false", "no", "off"):
+        return p
+    if p.lstrip().startswith("<|think|>"):
+        return p
+    return "<|think|>\n" + p
+
+
+SYSTEM_PROMPT = _thinking_prefixed_system_prompt()
 
 SENTENCE_SPLIT_RE = re.compile(r'(?<=[.!?])\s+')
 
@@ -316,29 +329,62 @@ def _looks_like_leaked_tool_output(s: str | None) -> bool:
     needles = (
         "<|tool_call",
         "<tool_call",
+        "<|tool>declaration",
+        "<|tool>",
+        "declaration:web_search",
         "call:respond_to_user",
-        "<|channel|>",
         "display_context:<|",
         "<tool_response",
     )
     return any(n in t for n in needles)
 
 
+def _strip_gemma_thinking_blocks(t: str) -> str:
+    """Remove Gemma 4 thought channels so TTS does not speak internal reasoning."""
+    # <|channel|>thought ... <|channel|> or <channel|> close variants
+    t = re.sub(
+        r"<\|channel\|>thought\s*\n.*?<\|channel\|>",
+        "",
+        t,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    t = re.sub(
+        r"<\|channel\|>thought\s*\n.*?<channel\|>",
+        "",
+        t,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    t = re.sub(r"<\|channel\|>.*?<\|channel\|>", "", t, flags=re.DOTALL | re.IGNORECASE)
+    t = re.sub(r"<\|channel\|>.*?<channel\|>", "", t, flags=re.DOTALL | re.IGNORECASE)
+    t = re.sub(r"<\|think\|>", "", t, flags=re.IGNORECASE)
+    return t.strip()
+
+
 def _sanitize_parlor_output(s: str | None) -> str:
-    """Strip Gemma/LiteRT tool fragments so they are never shown or spoken."""
+    """Strip Gemma/LiteRT tool fragments and thinking noise so they are never shown or spoken."""
     if not s:
         return ""
     t = _strip_model_text(s)
+    t = _strip_gemma_thinking_blocks(t)
+    cut = t.find("<|tool>declaration")
+    if cut != -1:
+        t = t[:cut].rstrip()
     cut = t.find("<|tool_call")
     if cut != -1:
         t = t[:cut].rstrip()
     cut = t.find("call:respond_to_user{")
     if cut != -1:
         t = t[:cut].rstrip()
+    t = re.sub(r"<\|tool\>declaration:.*?<\|tool\|>", "", t, flags=re.DOTALL)
+    t = re.sub(r"<\|tool\>.*?<\|tool\|>", "", t, flags=re.DOTALL)
     t = re.sub(r"<\|[^|]*\|>", "", t)
     t = re.sub(r"<tool_call[^>]*>", "", t, flags=re.I)
     t = re.sub(r"</?tool_call\|?>", "", t, flags=re.I)
     return t.strip()
+
+
+def _raw_text_suggests_gemma_thinking(raw: str) -> bool:
+    return "<|channel" in str(raw).lower()
 
 
 def _looks_like_degenerate_assistant_text(s: str | None) -> bool:
@@ -439,17 +485,13 @@ async def websocket_endpoint(ws: WebSocket):
         response: str = "",
         display_context: str = "",
         transcription: str = "",
-        turn: str = "",
-        payload: str = "",
     ) -> str:
-        """Plain string args; optional turn/payload JSON for legacy model output (expanded in policy)."""
+        """Three strings only—minimal LiteRT schema. Policy still expands legacy turn/payload in args."""
         args = merge_json_blob_arg(
             {
                 "response": response,
                 "display_context": display_context,
                 "transcription": transcription,
-                "turn": turn,
-                "payload": payload,
             },
             ("turn", "payload"),
         )
@@ -670,19 +712,30 @@ async def websocket_endpoint(ws: WebSocket):
                             text_response = _CONVERSATION_RESET_MESSAGE
                         else:
                             text_response = _scrub_tracking_urls(_sanitize_parlor_output(raw_text))
+                            thinkingish = _raw_text_suggests_gemma_thinking(raw_text)
                             if not text_response.strip():
-                                # Empty decode often means FC drift after heavy context—reset thread.
                                 text_response = _EMPTY_ASSISTANT_RETRY_MESSAGE
-                                needs_conversation_reset = True
-                                print(
-                                    "Parlor: empty assistant text without tools; resetting conversation"
-                                )
+                                if thinkingish:
+                                    print(
+                                        "Parlor: empty after sanitize; thinking channel only—no reset"
+                                    )
+                                else:
+                                    needs_conversation_reset = True
+                                    print(
+                                        "Parlor: empty assistant text without tools; resetting conversation"
+                                    )
                             elif _looks_like_degenerate_assistant_text(text_response):
-                                print(
-                                    "Parlor: degenerate assistant text without tools; resetting conversation"
-                                )
-                                needs_conversation_reset = True
-                                text_response = _EMPTY_ASSISTANT_RETRY_MESSAGE
+                                if thinkingish:
+                                    text_response = _EMPTY_ASSISTANT_RETRY_MESSAGE
+                                    print(
+                                        "Parlor: degenerate after strip but thinking present—no reset"
+                                    )
+                                else:
+                                    print(
+                                        "Parlor: degenerate assistant text without tools; resetting conversation"
+                                    )
+                                    needs_conversation_reset = True
+                                    text_response = _EMPTY_ASSISTANT_RETRY_MESSAGE
                         print(f"LLM ({llm_time:.2f}s) [no tool] raw head: {raw_text[:160]!r}…")
 
                 if needs_conversation_reset or recovered_from_litert_parse:

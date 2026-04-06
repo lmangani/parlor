@@ -335,42 +335,12 @@ def _wikipedia_snippets(query: str) -> str:
     return ""
 
 
-def web_search(
-    query: str | None = None,
-    q: str | None = None,
-    search_query: str | None = None,
-    topic: str | None = None,
-    keywords: str | None = None,
-    search: str | None = None,
-    text: str | None = None,
-    question: str | None = None,
-) -> str:
-    """Find information on the open web. Often includes auto-fetched text from the top result page.
+def web_search(query: str = "") -> str:
+    """Web lookup; results often include [Fetched page text] from the top hit—speak that content, not URLs.
 
-    For recipes, how-tos, and explanations, results usually contain a [Fetched page text] section:
-    turn that into a full spoken answer (ingredients, steps)—do not just list links or say visit a site.
-    Use short keyword queries; you may call more than once. Do not read backend labels aloud.
-
-    Args:
-        query: Main search string (preferred). Same meaning as q, topic, or question.
-        q: Alternate name for the search string.
-        search_query: Alternate name for the search string.
-        topic: Alternate name for the search string.
-        keywords: Alternate name for the search string.
-        search: Alternate name for the search string.
-        text: Alternate name for the search string.
-        question: Alternate name for the search string.
+    Pass a short keyword query only (one string keeps the tool schema small for LiteRT).
     """
-    args = {
-        "query": query,
-        "q": q,
-        "search_query": search_query,
-        "topic": topic,
-        "keywords": keywords,
-        "search": search,
-        "text": text,
-        "question": question,
-    }
+    args = {"query": query}
     raw_q = extract_search_query(args)
     if not raw_q:
         return "No search terms were provided. Call web_search again with a non-empty query."
@@ -535,34 +505,9 @@ def _append_auto_fetched_page_sections(search_output: str) -> str:
     )
 
 
-def read_web_page(
-    url: str | None = None,
-    link: str | None = None,
-    href: str | None = None,
-    page_url: str | None = None,
-    address: str | None = None,
-    website: str | None = None,
-    page: str | None = None,
-) -> str:
-    """Fetch a public web page as read-only text so you can summarize it for the user.
-
-    Use URLs from the latest search/link list or URLs the user gave. This only downloads
-    HTML or plain text (no JavaScript execution). Prefer one page per call; call again for
-    another link if needed.
-
-    Args:
-        url: Page address (https recommended).
-        link, href, page_url, address, website, page: Alternate names for the same URL.
-    """
-    args = {
-        "url": url,
-        "link": link,
-        "href": href,
-        "page_url": page_url,
-        "address": address,
-        "website": website,
-        "page": page,
-    }
+def read_web_page(url: str = "") -> str:
+    """Fetch one https page as plain text (no scripts). Pass the full URL string."""
+    args = {"url": url}
     raw = extract_page_url(args)
     if not raw:
         return "No URL was provided. Call read_web_page again with a full https link."
@@ -596,5 +541,5 @@ def read_web_page(
 
 
 def get_current_utc_time() -> str:
-    """Return the current date and time in UTC (ISO-style). Use when the user asks for the time or date."""
+    """Current UTC date/time (ISO-style)."""
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
