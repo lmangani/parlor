@@ -24,6 +24,7 @@ from tools_policy import (
     ParlorToolPolicy,
     build_optional_tools,
     coalesce_respond_to_user_fields,
+    merge_json_blob_arg,
     normalize_respond_to_user_merged_args,
 )
 
@@ -118,19 +119,23 @@ def build_system_prompt() -> str:
         )
     lines.extend(
         [
-            "- respond_to_user: REQUIRED last step every turn. Fields:",
-            "  • transcription: exact words the user said (optional if unclear—still set response "
-            "and/or display_context).",
-            "  • response: what you want spoken (TTS)—short, natural, 1–4 sentences for the ear. "
-            "Leave empty when you prefer text-only for this turn: if display_context is non-empty, "
-            "no audio is played and the user reads the transcript.",
-            "  • display_context: optional longer text shown in the transcript in parallel with TTS. "
-            "Put search summaries, bullet lists, URLs, numbered sources, step-by-step notes, or "
-            "anything too dense for voice. The user reads this while or after hearing response.",
-            "  Use display_context whenever tools returned detail worth keeping (especially web_search). "
-            "You may speak a brief overview in response and put the full breakdown in display_context.",
-            "  Never put tool syntax in response or display_context (no <|tool_call, no call:respond_to_user{, "
-            "no Gemma markup)—only natural language. Tools are invoked by the runtime, not typed out.",
+            "- respond_to_user: REQUIRED last step every turn. It has exactly ONE argument, `turn`: "
+            "a JSON object string (valid JSON). Keys (all optional strings): transcription, response, "
+            "display_context.",
+            "  • response: short text for TTS (1–4 sentences). May be \"\" if display_context has the "
+            "full answer (then the user reads the screen only).",
+            "  • display_context: bullets, URLs, numbered search results—too dense for voice.",
+            "  • transcription: what the user said, if you can infer it; may be \"\".",
+            "  CRITICAL for LiteRT: do NOT use multi-field tool syntax like "
+            "display_context:... ,response:... (easy to omit ':' and crash the parser). "
+            "Only pass turn=<|\"|>{...}<|\"|> with everything inside the JSON.",
+            "  Example turn value (one line if you can): "
+            '{"response":"Here are a few sites for events today.","display_context":"• Eventbrite …\\n• I amsterdam …"}',
+            "  Escape double quotes inside strings as \\\". Use \\\\n for newlines inside JSON strings.",
+            "  Emit exactly ONE respond_to_user call per turn—never duplicate it, never prefix "
+            '"code block:" or paste the call twice.',
+            "  Never put tool markup inside JSON values (no <|tool_call, no call:respond_to_user)—"
+            "only natural language inside the strings.",
             "",
         ]
     )
@@ -274,6 +279,11 @@ _EMPTY_ASSISTANT_RETRY_MESSAGE = (
     "For example, 'pick the first recipe you found,' or 'read out that link.'"
 )
 
+_LITERT_TOOL_PARSE_MESSAGE = (
+    "Something went wrong formatting the reply. Say your question once more—I'll answer without "
+    "repeating that step."
+)
+
 
 @app.get("/")
 async def root():
@@ -289,81 +299,14 @@ async def websocket_endpoint(ws: WebSocket):
     tool_trace: list[str] = []
     search_memory: dict[str, str] = {"query": "", "text": ""}
 
-    def respond_to_user(
-        transcription: str = "",
-        transcript: str = "",
-        user_speech: str = "",
-        speech: str = "",
-        user_message: str = "",
-        what_the_user_said: str = "",
-        response: str = "",
-        reply: str = "",
-        spoken_response: str = "",
-        voice_response: str = "",
-        answer: str = "",
-        spoken: str = "",
-        text: str = "",
-        message: str = "",
-        content: str = "",
-        body: str = "",
-        final_response: str = "",
-        assistant_message: str = "",
-        say: str = "",
-        value: str = "",
-        display_context: str = "",
-        screen_text: str = "",
-        details: str = "",
-        notes: str = "",
-        context: str = "",
-        formatted_context: str = "",
-        markdown: str = "",
-        links: str = "",
-        sources: str = "",
-        urls: str = "",
-        bullets: str = "",
-    ) -> str:
-        """Deliver the turn: what to speak (TTS) and/or what to show on screen.
+    def respond_to_user(turn: str = "") -> str:
+        """Single FC argument: JSON with optional transcription, response, display_context.
 
-        Optional aliases mirror tools_policy.coalesce_respond_to_user_fields so Gemma/LiteRT
-        can use alternate argument names; transcription may be omitted.
+        Multi-field function-call syntax is fragile in LiteRT; one string blob parses reliably.
         """
-        tr, r, d = coalesce_respond_to_user_fields(
-            normalize_respond_to_user_merged_args(
-                {
-                    "transcription": transcription,
-                    "transcript": transcript,
-                    "user_speech": user_speech,
-                    "speech": speech,
-                    "user_message": user_message,
-                    "what_the_user_said": what_the_user_said,
-                    "response": response,
-                    "reply": reply,
-                    "spoken_response": spoken_response,
-                    "voice_response": voice_response,
-                    "answer": answer,
-                    "spoken": spoken,
-                    "text": text,
-                    "message": message,
-                    "content": content,
-                    "body": body,
-                    "final_response": final_response,
-                    "assistant_message": assistant_message,
-                    "say": say,
-                    "value": value,
-                    "display_context": display_context,
-                    "screen_text": screen_text,
-                    "details": details,
-                    "notes": notes,
-                    "context": context,
-                    "formatted_context": formatted_context,
-                    "markdown": markdown,
-                    "links": links,
-                    "sources": sources,
-                    "urls": urls,
-                    "bullets": bullets,
-                }
-            )
-        )
+        args = merge_json_blob_arg({"turn": turn}, ("turn", "payload"))
+        args = normalize_respond_to_user_merged_args(args)
+        tr, r, d = coalesce_respond_to_user_fields(args)
         tool_result["transcription"] = tr
         tool_result["response"] = r
         tool_result["display_context"] = d
@@ -492,9 +435,15 @@ async def websocket_endpoint(ws: WebSocket):
                 t0 = time.time()
                 tool_result.clear()
                 tool_trace.clear()
-                response = await asyncio.get_event_loop().run_in_executor(
-                    None, lambda: conversation.send_message({"role": "user", "content": content})
-                )
+                response = None
+                litert_error: str | None = None
+                try:
+                    response = await asyncio.get_event_loop().run_in_executor(
+                        None, lambda: conversation.send_message({"role": "user", "content": content})
+                    )
+                except RuntimeError as ex:
+                    litert_error = str(ex)
+                    print(f"Parlor: LiteRT send_message RuntimeError: {litert_error[:800]}")
                 llm_time = time.time() - t0
 
                 # Extract response from tool call or fallback to raw text
@@ -503,7 +452,11 @@ async def websocket_endpoint(ws: WebSocket):
                 transcription = None
                 needs_conversation_reset = False
 
-                if tool_result:
+                if litert_error is not None:
+                    needs_conversation_reset = True
+                    text_response = _LITERT_TOOL_PARSE_MESSAGE
+                    print(f"LLM ({llm_time:.2f}s) [error] tool parse / runtime failure")
+                elif tool_result:
                     transcription = _strip_model_text(tool_result.get("transcription", ""))
                     if _looks_like_leaked_tool_output(transcription):
                         transcription = ""
@@ -539,17 +492,23 @@ async def websocket_endpoint(ws: WebSocket):
                         f"skip_audio={skip_audio}"
                     )
                 else:
-                    raw_text = response["content"][0]["text"]
-                    if _looks_like_leaked_tool_output(raw_text):
-                        print("Parlor: leaked tool syntax in assistant text; resetting conversation")
-                        needs_conversation_reset = True
-                        text_response = _CONVERSATION_RESET_MESSAGE
+                    if not response:
+                        text_response = _EMPTY_ASSISTANT_RETRY_MESSAGE
+                        print(f"LLM ({llm_time:.2f}s) [no response object]")
                     else:
-                        text_response = _scrub_tracking_urls(_sanitize_parlor_output(raw_text))
-                        if not text_response.strip():
-                            # Empty or token-only decode (e.g. <|"|>)—keep conversation history.
-                            text_response = _EMPTY_ASSISTANT_RETRY_MESSAGE
-                    print(f"LLM ({llm_time:.2f}s) [no tool] raw head: {raw_text[:160]!r}…")
+                        raw_text = response["content"][0]["text"]
+                        if _looks_like_leaked_tool_output(raw_text):
+                            print(
+                                "Parlor: leaked tool syntax in assistant text; resetting conversation"
+                            )
+                            needs_conversation_reset = True
+                            text_response = _CONVERSATION_RESET_MESSAGE
+                        else:
+                            text_response = _scrub_tracking_urls(_sanitize_parlor_output(raw_text))
+                            if not text_response.strip():
+                                # Empty or token-only decode (e.g. <|"|>)—keep conversation history.
+                                text_response = _EMPTY_ASSISTANT_RETRY_MESSAGE
+                        print(f"LLM ({llm_time:.2f}s) [no tool] raw head: {raw_text[:160]!r}…")
 
                 if needs_conversation_reset:
                     reopen_conversation()

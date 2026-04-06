@@ -50,7 +50,7 @@ _DISPLAY_KEYS = (
 )
 
 _KNOWN_RESPOND_ARG_KEYS = frozenset(
-    _TRANSCRIPTION_KEYS + _RESPONSE_KEYS + _DISPLAY_KEYS + ("value",)
+    _TRANSCRIPTION_KEYS + _RESPONSE_KEYS + _DISPLAY_KEYS + ("value", "turn", "payload")
 )
 
 
@@ -94,6 +94,32 @@ def coalesce_respond_to_user_fields(args: dict[str, Any]) -> tuple[str, str, str
                 d = candidates[1][1]
 
     return (tr, r, d)
+
+
+def merge_json_blob_arg(args: dict[str, Any], blob_keys: tuple[str, ...]) -> dict[str, Any]:
+    """Expand Gemma/LiteRT `turn` / `payload` (JSON object string) into flat keyword args.
+
+    One string argument parses reliably; multi-field FC calls often break (e.g. missing ':').
+    """
+    a = dict(args)
+    for key in blob_keys:
+        raw = a.get(key)
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        s = raw.strip()
+        rest = {k: v for k, v in a.items() if k != key}
+        try:
+            parsed = json.loads(s)
+        except json.JSONDecodeError:
+            if not rest:
+                return {"response": s}
+            return {**rest, "response": s}
+        if isinstance(parsed, dict):
+            return {**parsed, **rest}
+        if isinstance(parsed, str):
+            return {**rest, "response": parsed}
+        return {**rest, "response": json.dumps(parsed, ensure_ascii=False)}
+    return a
 
 
 def normalize_respond_to_user_merged_args(raw: dict[str, Any]) -> dict[str, Any]:
@@ -211,6 +237,7 @@ class ParlorToolPolicy(litert_lm.ToolEventHandler):
                 return False
 
         if name == "respond_to_user":
+            args = merge_json_blob_arg(args, ("turn", "payload"))
             args = normalize_respond_to_user_merged_args(args)
             _tr, r, d = coalesce_respond_to_user_fields(args)
             # Transcription is optional: Gemma often omits it or uses other keys; never block the turn.
