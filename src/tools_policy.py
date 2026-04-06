@@ -8,7 +8,14 @@ from typing import Any
 
 import litert_lm
 
-from agent_tools import MAX_QUERY_LEN, extract_search_query
+from agent_tools import (
+    MAX_PAGE_URL_LEN,
+    MAX_QUERY_LEN,
+    extract_page_url,
+    extract_search_query,
+    normalize_user_url,
+    url_is_allowed_for_fetch,
+)
 
 MAX_TOOL_RESPONSE_CHARS = 14000
 
@@ -236,6 +243,22 @@ class ParlorToolPolicy(litert_lm.ToolEventHandler):
                 print("web_search denied: query too long")
                 return False
 
+        if name == "read_web_page":
+            u = extract_page_url(args)
+            if not u:
+                print(
+                    "read_web_page denied: no usable URL in arguments; keys=",
+                    list(args.keys()),
+                )
+                return False
+            nu = normalize_user_url(u)
+            if len(nu) > MAX_PAGE_URL_LEN:
+                print("read_web_page denied: URL too long")
+                return False
+            if not url_is_allowed_for_fetch(nu):
+                print("read_web_page denied: URL not allowed", nu[:120])
+                return False
+
         if name == "respond_to_user":
             args = merge_json_blob_arg(args, ("turn", "payload"))
             args = normalize_respond_to_user_merged_args(args)
@@ -260,16 +283,19 @@ class ParlorToolPolicy(litert_lm.ToolEventHandler):
 def build_optional_tools(
     *,
     enable_web_search: bool,
+    enable_read_web_page: bool,
     enable_utc_time: bool,
     web_search_impl: Any | None = None,
 ) -> list[Any]:
-    """Tool order: web_search before time so the schema highlights search for factual turns."""
-    from agent_tools import get_current_utc_time, web_search
+    """Tool order: discover links, then optional deep read, then time."""
+    from agent_tools import get_current_utc_time, read_web_page, web_search
 
     ws = web_search_impl if web_search_impl is not None else web_search
     tools: list[Any] = []
     if enable_web_search:
         tools.append(ws)
+    if enable_read_web_page:
+        tools.append(read_web_page)
     if enable_utc_time:
         tools.append(get_current_utc_time)
     return tools

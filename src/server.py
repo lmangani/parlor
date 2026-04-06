@@ -45,16 +45,22 @@ def resolve_model_path() -> str:
 MODEL_PATH = resolve_model_path()
 
 
-def _optional_tool_flags() -> tuple[bool, bool]:
-    """PARLOR_TOOLS: comma-separated subset, or 'none', default enables web + time."""
-    raw = os.environ.get("PARLOR_TOOLS", "web_search,get_current_utc_time").strip().lower()
+def _optional_tool_flags() -> tuple[bool, bool, bool]:
+    """PARLOR_TOOLS: comma-separated subset, or 'none'. Default: lookup + read page + time."""
+    raw = os.environ.get(
+        "PARLOR_TOOLS", "web_search,read_web_page,get_current_utc_time"
+    ).strip().lower()
     if raw == "none":
-        return False, False
+        return False, False, False
     parts = {p.strip() for p in raw.split(",") if p.strip()}
-    return "web_search" in parts, "get_current_utc_time" in parts
+    return (
+        "web_search" in parts,
+        "read_web_page" in parts,
+        "get_current_utc_time" in parts,
+    )
 
 
-ENABLE_WEB_SEARCH, ENABLE_UTC_TIME = _optional_tool_flags()
+ENABLE_WEB_SEARCH, ENABLE_READ_WEB_PAGE, ENABLE_UTC_TIME = _optional_tool_flags()
 
 SEARCH_MEMORY_CAP = int(os.environ.get("PARLOR_SEARCH_MEMORY_CHARS", "9000"))
 
@@ -82,12 +88,13 @@ def _user_text_search_memory_append(memory: dict[str, str]) -> str:
         return ""
     q = (memory.get("query") or "").strip()
     return (
-        "\n\n---\n[Latest web_search snapshot for this session — treat as ground truth for "
-        "follow-ups: numbered results, first vs second link, hostnames, paths, and snippets.]\n"
+        "\n\n---\n[Latest lookup snapshot for this session — ground truth for follow-ups: "
+        "numbered results, first vs second link, hostnames, paths, snippets.]\n"
         f"Query: {q}\n---\n{t}\n---\n"
-        "If something the user asks is not covered here, or they need verification or fresher "
-        "information, call web_search again with a targeted query before respond_to_user. "
-        "Never guess URLs.\n---"
+        "If the user wants details from one of those links, call read_web_page with that https URL, "
+        "then summarize in your own words (voice-first). "
+        "If something is still missing or they want fresher facts, run another lookup, then "
+        "respond_to_user. Never invent URLs.\n---"
     )
 
 
@@ -101,16 +108,28 @@ def build_system_prompt() -> str:
         "choose how much to say aloud vs what to show as text. The user cannot see your raw tool "
         "logs—only what you put in respond_to_user.",
         "",
+        "Voice UX: speak naturally (e.g. 'here is what I found'). Do not name search engines, "
+        "vendors, or tools to the user unless they ask how you work.",
+        "",
         "Tools:",
     ]
     if ENABLE_WEB_SEARCH:
         lines.extend(
             [
-                "- web_search: Your main way to learn about the real world. Use it whenever the user "
-                "asks about news, weather, sports, stocks, people, places, products, events, "
-                '"what happened", "who won", definitions, or anything you are not 100% sure about. '
-                "Prefer searching over inventing facts. Pass a short keyword query (you may call "
-                "it more than once with different queries).",
+                "- web_search: Find fresh pointers and short snippets on the open web when the user "
+                "asks about news, weather, events, places, products, or anything you should verify. "
+                "Use short keyword queries; you may call more than once. Results are for you to read "
+                "and paraphrase—never read tool labels aloud.",
+                "",
+            ]
+        )
+    if ENABLE_READ_WEB_PAGE:
+        lines.extend(
+            [
+                "- read_web_page: Load one public https page as plain text (no scripts run) so you can "
+                "answer from the actual article or listing. Use a full URL from the latest lookup "
+                "snapshot or one the user gave you. Call once per page; then summarize in speech. "
+                "If a URL is blocked or empty, say so briefly and offer alternatives.",
                 "",
             ]
         )
@@ -142,17 +161,25 @@ def build_system_prompt() -> str:
     if ENABLE_WEB_SEARCH:
         lines.extend(
             [
-                "Session search memory: The user message may include a [Latest web_search snapshot] "
-                "block with the most recent successful web_search for this connection. Prefer it "
-                "for follow-ups (first result, that site, read this URL) so you keep exact links and "
-                "ordering even if the chat transcript is lossy.",
+                "Session memory: The user message may include a [Latest lookup snapshot] block from "
+                "the most recent successful web_search. Prefer it for follow-ups (first link, exact "
+                "URLs, order). For 'what does that page say?' use read_web_page on the chosen https "
+                "URL, then respond_to_user.",
                 "",
-                "Follow-ups: Use the snapshot plus chat history. If the snapshot lacks what you "
-                "need, or the user wants new or updated web facts, call web_search again, then "
+                "Follow-ups: Combine snapshot + chat. If you need newer or different pointers, "
+                "web_search again; if you need body text from one link, read_web_page, then "
                 "respond_to_user.",
                 "",
-                "Workflow: When you need web facts, call web_search, read the tool result, then "
-                "call respond_to_user. For small talk with no web need, respond_to_user only. "
+                "Workflow: When you need pointers, web_search; when you need to read a specific page, "
+                "read_web_page; then always respond_to_user. Small talk: respond_to_user only. "
+                "Never output plain assistant text without respond_to_user.",
+            ]
+        )
+    elif ENABLE_READ_WEB_PAGE:
+        lines.extend(
+            [
+                "Workflow: When the user shares an https link or wants details from a specific page, "
+                "call read_web_page, then respond_to_user. Otherwise respond_to_user only. "
                 "Never output plain assistant text without respond_to_user.",
             ]
         )
@@ -185,7 +212,7 @@ def load_models():
     print("Engine loaded.")
     print(
         f"Agent tools (env PARLOR_TOOLS): web_search={ENABLE_WEB_SEARCH}, "
-        f"get_current_utc_time={ENABLE_UTC_TIME}"
+        f"read_web_page={ENABLE_READ_WEB_PAGE}, get_current_utc_time={ENABLE_UTC_TIME}"
     )
 
     tts_backend = tts.load()
@@ -364,6 +391,7 @@ async def websocket_endpoint(ws: WebSocket):
     )
     optional = build_optional_tools(
         enable_web_search=ENABLE_WEB_SEARCH,
+        enable_read_web_page=ENABLE_READ_WEB_PAGE,
         enable_utc_time=ENABLE_UTC_TIME,
         web_search_impl=web_search_impl,
     )
@@ -436,10 +464,16 @@ async def websocket_endpoint(ws: WebSocket):
                 search_hint = ""
                 if ENABLE_WEB_SEARCH:
                     search_hint = (
-                        " If this message includes [Latest web_search snapshot], use it for follow-ups "
-                        "(first link, that recipe, named sites, exact URLs). If something is still "
-                        "missing or the user wants new or updated web information, call web_search, "
-                        "then respond_to_user. Put URLs and bullets in display_context; keep voice concise."
+                        " If this message includes [Latest lookup snapshot], use it for follow-ups "
+                        "(first link, exact URLs). For what a specific page says, call read_web_page "
+                        "with that https URL when available, then respond_to_user. "
+                        "If you need new pointers, call web_search first. "
+                        "Put URLs and bullets in display_context; keep voice concise and natural."
+                    )
+                elif ENABLE_READ_WEB_PAGE:
+                    search_hint = (
+                        " For page details, call read_web_page with a full https URL the user gave you, "
+                        "then respond_to_user."
                     )
                 tail = memory_append + search_hint
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import html as html_lib
+import ipaddress
 import json
 import os
 import re
@@ -25,6 +26,16 @@ _SEARCH_ARG_KEYS = (
 )
 
 
+def extract_page_url(args: dict[str, Any]) -> str | None:
+    if not isinstance(args, dict):
+        return None
+    for key in _PAGE_URL_ARG_KEYS:
+        v = args.get(key)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return None
+
+
 def extract_search_query(args: dict[str, Any]) -> str | None:
     if not isinstance(args, dict):
         return None
@@ -38,8 +49,21 @@ DEFAULT_TIMEOUT_S = float(os.environ.get("PARLOR_HTTP_TIMEOUT", "12"))
 MAX_QUERY_LEN = int(os.environ.get("PARLOR_MAX_SEARCH_QUERY_LEN", "240"))
 MAX_WEB_BODY_BYTES = int(os.environ.get("PARLOR_MAX_WEB_BODY_BYTES", "400000"))
 MAX_COMBINED_SEARCH_CHARS = int(os.environ.get("PARLOR_MAX_WEB_SEARCH_CHARS", "4000"))
+MAX_READ_PAGE_CHARS = int(os.environ.get("PARLOR_MAX_READ_PAGE_CHARS", "10000"))
+MAX_PAGE_URL_LEN = int(os.environ.get("PARLOR_MAX_PAGE_URL_LEN", "2048"))
 
 _USER_AGENT = "Parlor/0.1 (local voice assistant; +https://github.com/fikrikarim/parlor)"
+
+# Gemma / LiteRT may emit different keys for a page URL.
+_PAGE_URL_ARG_KEYS = (
+    "url",
+    "link",
+    "href",
+    "page_url",
+    "address",
+    "website",
+    "page",
+)
 
 
 def _fetch(url: str, *, timeout: float = DEFAULT_TIMEOUT_S) -> bytes:
@@ -95,6 +119,45 @@ def _normalize_result_url(href: str) -> str:
         if inner:
             return urllib.parse.unquote(inner)
     return h
+
+
+def normalize_user_url(url: str) -> str:
+    """Public alias for normalizing tracking redirects (e.g. DDG) to a real destination."""
+    return _normalize_result_url(url).strip()
+
+
+def url_is_allowed_for_fetch(url: str) -> bool:
+    """http(s) only, no obvious SSRF targets, and passes user-visible URL hygiene."""
+    u = normalize_user_url(url)
+    if not u or len(u) > MAX_PAGE_URL_LEN:
+        return False
+    if not url_is_safe_for_user(u):
+        return False
+    try:
+        parsed = urllib.parse.urlparse(u)
+    except ValueError:
+        return False
+    if parsed.scheme not in ("http", "https"):
+        return False
+    host = (parsed.hostname or "").strip().lower()
+    if not host or "@" in (parsed.netloc or ""):
+        return False
+    if host in ("localhost", "127.0.0.1", "::1", "0.0.0.0", "metadata.google.internal"):
+        return False
+    try:
+        ip = ipaddress.ip_address(host)
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+        ):
+            return False
+    except ValueError:
+        pass
+    return True
 
 
 def url_is_safe_for_user(url: str) -> bool:
@@ -275,11 +338,11 @@ def web_search(
     text: str | None = None,
     question: str | None = None,
 ) -> str:
-    """Search the public web for real-world facts—use often, not only as a last resort.
+    """Find pointers and short snippets on the open web—use often, not only as a last resort.
 
-    Call this when the user asks about news, weather, sports, people, places, products,
-    dates of events, definitions, or anything that should be checked online. Use short
-    keyword-style queries; you can call it more than once with refined queries if needed.
+    Call when the user asks about news, weather, events, places, products, or anything to verify.
+    Use short keyword queries; you may call more than once. Paraphrase for the user in speech;
+    do not read backend labels aloud.
 
     Args:
         query: Main search string (preferred). Same meaning as q, topic, or question.
@@ -312,27 +375,27 @@ def web_search(
     try:
         ddg = _duckduckgo_instant(qn)
         if ddg:
-            parts.append("[DuckDuckGo instant]\n" + ddg)
+            parts.append("[Quick answer]\n" + ddg)
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as e:
-        parts.append(f"[DuckDuckGo instant failed: {e}]")
+        parts.append(f"[Quick answer lookup failed: {e}]")
 
     combined = "\n\n".join(parts)
     if len(combined.strip()) < 160:
         try:
             html_hits = _duckduckgo_html(qn)
             if html_hits:
-                parts.append("[DuckDuckGo web results]\n" + html_hits)
+                parts.append("[Pages found — titles and links]\n" + html_hits)
         except (urllib.error.URLError, TimeoutError, OSError) as e:
-            parts.append(f"[DuckDuckGo HTML failed: {e}]")
+            parts.append(f"[Page list lookup failed: {e}]")
 
     combined = "\n\n".join(parts)
     if len(combined.strip()) < 120:
         try:
             wiki = _wikipedia_snippets(qn)
             if wiki:
-                parts.append("[Wikipedia]\n" + wiki)
+                parts.append("[Encyclopedia excerpt]\n" + wiki)
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as e:
-            parts.append(f"[Wikipedia failed: {e}]")
+            parts.append(f"[Encyclopedia lookup failed: {e}]")
 
     out = "\n\n".join(parts).strip()
     if not out:
@@ -340,6 +403,119 @@ def web_search(
     if len(out) > MAX_COMBINED_SEARCH_CHARS:
         return out[: MAX_COMBINED_SEARCH_CHARS - 20] + "\n…[truncated]"
     return out
+
+
+def _html_page_title(html: str) -> str:
+    m = re.search(r"<title[^>]*>([^<]{1,400})</title>", html, re.I | re.DOTALL)
+    if not m:
+        return ""
+    return _strip_tags(m.group(1))[:300]
+
+
+def _strip_html_to_text(html: str, max_chars: int) -> str:
+    t = re.sub(r"(?is)<script[^>]*>.*?</script>", " ", html)
+    t = re.sub(r"(?is)<style[^>]*>.*?</style>", " ", t)
+    t = re.sub(r"(?is)<noscript[^>]*>.*?</noscript>", " ", t)
+    t = _strip_tags(t)
+    if len(t) > max_chars:
+        cut = t[: max_chars - 40].rsplit(" ", 1)[0]
+        t = cut + "\n…[truncated]"
+    return t
+
+
+def read_web_page(
+    url: str | None = None,
+    link: str | None = None,
+    href: str | None = None,
+    page_url: str | None = None,
+    address: str | None = None,
+    website: str | None = None,
+    page: str | None = None,
+) -> str:
+    """Fetch a public web page as read-only text so you can summarize it for the user.
+
+    Use URLs from the latest search/link list or URLs the user gave. This only downloads
+    HTML or plain text (no JavaScript execution). Prefer one page per call; call again for
+    another link if needed.
+
+    Args:
+        url: Page address (https recommended).
+        link, href, page_url, address, website, page: Alternate names for the same URL.
+    """
+    args = {
+        "url": url,
+        "link": link,
+        "href": href,
+        "page_url": page_url,
+        "address": address,
+        "website": website,
+        "page": page,
+    }
+    raw = extract_page_url(args)
+    if not raw:
+        return "No URL was provided. Call read_web_page again with a full https link."
+    u = normalize_user_url(raw)
+    if len(u) > MAX_PAGE_URL_LEN:
+        return "That URL is too long. Use a shorter link."
+    if not url_is_allowed_for_fetch(u):
+        return (
+            "That link cannot be opened from here (blocked for safety). "
+            "Use a normal public https page from your earlier results or the user."
+        )
+    try:
+        req = urllib.request.Request(
+            u,
+            headers={
+                "User-Agent": _USER_AGENT,
+                "Accept": "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.5",
+            },
+            method="GET",
+        )
+        with urllib.request.urlopen(req, timeout=DEFAULT_TIMEOUT_S) as resp:
+            ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            body = resp.read(MAX_WEB_BODY_BYTES)
+    except urllib.error.HTTPError as e:
+        return f"The server returned HTTP {e.code} for that page. Try another link or summarize from snippets only."
+    except urllib.error.URLError as e:
+        return f"Could not load the page ({e.reason!r}). Check the URL or try a different result."
+    except (TimeoutError, OSError) as e:
+        return f"Loading the page failed ({e}). Try again or use another URL."
+
+    try:
+        text_body = body.decode("utf-8", errors="replace")
+    except Exception:
+        text_body = body.decode("latin-1", errors="replace")
+
+    title = ""
+    main: str
+    if "json" in ctype:
+        try:
+            j = json.loads(text_body)
+            main = json.dumps(j, ensure_ascii=False, indent=2)
+        except json.JSONDecodeError:
+            main = text_body
+    elif "html" in ctype or not ctype or ctype == "application/octet-stream":
+        title = _html_page_title(text_body)
+        main = _strip_html_to_text(text_body, MAX_READ_PAGE_CHARS)
+    else:
+        main = text_body
+
+    main = main.strip()
+    if len(main) > MAX_READ_PAGE_CHARS:
+        main = main[: MAX_READ_PAGE_CHARS - 30] + "\n…[truncated]"
+
+    if not main:
+        return "The page had almost no readable text (maybe scripts-only or empty). Try another URL."
+
+    head = (
+        "Below is read-only text from the page—summarize in natural spoken language for a voice "
+        "assistant. Do not quote the search tool by name; speak as if you read the page.\n"
+        f"URL: {u}\n"
+    )
+    if title:
+        head += f"Title: {title}\n"
+    head += "\n---\n"
+    return head + main
 
 
 def get_current_utc_time() -> str:

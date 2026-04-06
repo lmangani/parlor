@@ -693,8 +693,13 @@ function connect() {
           lastUserMsg.innerHTML = `${msg.transcription}${meta ? meta.outerHTML : ''}`;
         }
       }
+      const hiddenTools = new Set([
+        'respond_to_user',
+        'web_search',
+        'read_web_page',
+      ]);
       const used = Array.isArray(msg.tools_used)
-        ? msg.tools_used.filter((t) => t !== 'respond_to_user')
+        ? msg.tools_used.filter((t) => !hiddenTools.has(t))
         : [];
       const toolsSuffix = used.length ? ` · ${used.join(', ')}` : '';
       addMessage(
