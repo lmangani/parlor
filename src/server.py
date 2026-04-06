@@ -33,11 +33,18 @@ def resolve_model_path() -> str:
 
 
 MODEL_PATH = resolve_model_path()
+
+LLM_TIMEOUT_SEC = float(os.environ.get("PARLOR_LLM_TIMEOUT_SEC", "120"))
+
 SYSTEM_PROMPT = (
-    "You are a friendly, conversational AI assistant. The user is talking to you "
-    "through a microphone and showing you their camera. "
+    "You are a friendly, conversational AI assistant. "
+    "Each user turn includes only what the client sent—do not assume voice, text, or camera if missing. "
+    "Turn shapes: (1) typed text only, (2) typed text plus one camera image, (3) voice audio only, "
+    "(4) voice audio plus one camera image. Typed text and voice are never both present in the same turn. "
     "You MUST always use the respond_to_user tool to reply. "
-    "First transcribe exactly what the user said, then write your response."
+    "For voice turns: set transcription to exactly what the user said, then response. "
+    "For typed turns: set transcription to a short label such as \"typed message\" or the first few "
+    "words of their text, then response."
 )
 
 SENTENCE_SPLIT_RE = re.compile(r'(?<=[.!?])\s+')
@@ -91,6 +98,10 @@ def split_sentences(text: str) -> list[str]:
     """Split text into sentences for streaming TTS."""
     parts = SENTENCE_SPLIT_RE.split(text.strip())
     return [s.strip() for s in parts if s.strip()]
+
+
+def _strip_tool_str(s: str | None) -> str:
+    return (s or "").replace('<|"|>', "").strip()
 
 
 @app.get("/")
@@ -151,48 +162,149 @@ async def websocket_endpoint(ws: WebSocket):
             interrupted.clear()
 
             try:
-                if msg.get("audio"):
+                user_text = (msg.get("text") or "").strip()
+                has_audio = bool(msg.get("audio"))
+                if user_text and has_audio:
+                    print("Parlor: text and audio in one message; using typed text only")
+                    has_audio = False
+
+                if has_audio:
                     audio_path = save_temp(base64.b64decode(msg["audio"]), ".wav")
                 if msg.get("image"):
                     image_path = save_temp(base64.b64decode(msg["image"]), ".jpg")
 
-                # Build multimodal content
-                content = []
-                if audio_path:
+                content: list[dict] = []
+                if user_text and not has_audio:
+                    if image_path:
+                        content.append({"type": "image", "path": os.path.abspath(image_path)})
+                        content.append(
+                            {
+                                "type": "text",
+                                "text": (
+                                    "The user sent a typed message and included a current camera image "
+                                    "(no voice in this turn). Answer using their text and what you see; "
+                                    "do not invent spoken input.\n\n"
+                                    + user_text
+                                ),
+                            }
+                        )
+                    else:
+                        content.append(
+                            {
+                                "type": "text",
+                                "text": (
+                                    "The user sent a typed message only (no voice and no camera image in this turn). "
+                                    "Answer their message; do not invent spoken input.\n\n"
+                                    + user_text
+                                ),
+                            }
+                        )
+                elif has_audio:
                     content.append({"type": "audio", "path": os.path.abspath(audio_path)})
-                if image_path:
-                    content.append({"type": "image", "path": os.path.abspath(image_path)})
-
-                if audio_path and image_path:
-                    content.append({"type": "text", "text": "The user just spoke to you (audio) while showing their camera (image). Respond to what they said, referencing what you see if relevant."})
-                elif audio_path:
-                    content.append({"type": "text", "text": "The user just spoke to you. Respond to what they said."})
-                elif image_path:
-                    content.append({"type": "text", "text": "The user is showing you their camera. Describe what you see."})
+                    if image_path:
+                        content.append({"type": "image", "path": os.path.abspath(image_path)})
+                    if audio_path and image_path:
+                        content.append(
+                            {
+                                "type": "text",
+                                "text": (
+                                    "The user just spoke to you (audio) while showing their camera (image). "
+                                    "Respond to what they said, referencing what you see if relevant."
+                                ),
+                            }
+                        )
+                    else:
+                        content.append(
+                            {
+                                "type": "text",
+                                "text": (
+                                    "The user just spoke to you (voice only; no camera image in this turn). "
+                                    "Respond to what they said; do not describe a scene you were not shown."
+                                ),
+                            }
+                        )
                 else:
-                    content.append({"type": "text", "text": msg.get("text", "Hello!")})
+                    await ws.send_text(
+                        json.dumps(
+                            {
+                                "type": "text",
+                                "text": "Send a voice message or type something in the text box.",
+                                "llm_time": 0.0,
+                                "error": True,
+                            }
+                        )
+                    )
+                    continue
 
-                # LLM inference
+                loop = asyncio.get_event_loop()
                 t0 = time.time()
                 tool_result.clear()
-                response = await asyncio.get_event_loop().run_in_executor(
-                    None, lambda: conversation.send_message({"role": "user", "content": content})
-                )
+                try:
+                    response = await asyncio.wait_for(
+                        loop.run_in_executor(
+                            None,
+                            lambda: conversation.send_message({"role": "user", "content": content}),
+                        ),
+                        timeout=LLM_TIMEOUT_SEC,
+                    )
+                except asyncio.TimeoutError:
+                    llm_time = time.time() - t0
+                    print(f"Parlor: LLM timed out after {llm_time:.2f}s")
+                    await ws.send_text(
+                        json.dumps(
+                            {
+                                "type": "text",
+                                "text": "That took too long and timed out. Try a shorter question.",
+                                "llm_time": round(llm_time, 2),
+                                "error": True,
+                            }
+                        )
+                    )
+                    continue
+                except Exception as ex:
+                    llm_time = time.time() - t0
+                    print(f"Parlor: LLM error: {ex!r}")
+                    await ws.send_text(
+                        json.dumps(
+                            {
+                                "type": "text",
+                                "text": "Something went wrong while thinking. Please try again.",
+                                "llm_time": round(llm_time, 2),
+                                "error": True,
+                            }
+                        )
+                    )
+                    continue
+
                 llm_time = time.time() - t0
 
-                # Extract response from tool call or fallback to raw text
                 if tool_result:
-                    strip = lambda s: s.replace('<|"|>', "").strip()
-                    transcription = strip(tool_result.get("transcription", ""))
-                    text_response = strip(tool_result.get("response", ""))
-                    print(f"LLM ({llm_time:.2f}s) [tool] heard: {transcription!r} → {text_response}")
+                    transcription = _strip_tool_str(tool_result.get("transcription"))
+                    text_response = _strip_tool_str(tool_result.get("response"))
+                    print(f"LLM ({llm_time:.2f}s) [tool] heard: {transcription!r} → {text_response!r}")
                 else:
                     transcription = None
-                    text_response = response["content"][0]["text"]
-                    print(f"LLM ({llm_time:.2f}s) [no tool]: {text_response}")
+                    raw_blocks = response.get("content") or [{}]
+                    text_response = _strip_tool_str(
+                        raw_blocks[0].get("text") if raw_blocks else ""
+                    )
+                    print(f"LLM ({llm_time:.2f}s) [no tool]: {text_response!r}")
+
+                if not text_response:
+                    text_response = "I could not generate a reply. Please try again."
 
                 if interrupted.is_set():
                     print("Interrupted after LLM, skipping response")
+                    await ws.send_text(
+                        json.dumps(
+                            {
+                                "type": "text",
+                                "text": "",
+                                "llm_time": round(llm_time, 2),
+                                "cancelled": True,
+                            }
+                        )
+                    )
                     continue
 
                 reply = {"type": "text", "text": text_response, "llm_time": round(llm_time, 2)}
@@ -202,51 +314,80 @@ async def websocket_endpoint(ws: WebSocket):
 
                 if interrupted.is_set():
                     print("Interrupted before TTS, skipping audio")
+                    await ws.send_text(
+                        json.dumps({"type": "audio_end", "tts_time": 0.0, "cancelled": True})
+                    )
                     continue
 
-                # Streaming TTS: split into sentences and send chunks progressively
                 sentences = split_sentences(text_response)
                 if not sentences:
-                    sentences = [text_response]
+                    sentences = [text_response] if text_response else ["Sorry, I had nothing to say."]
 
                 tts_start = time.time()
 
-                # Signal start of audio stream
-                await ws.send_text(json.dumps({
-                    "type": "audio_start",
-                    "sample_rate": tts_backend.sample_rate,
-                    "sentence_count": len(sentences),
-                }))
+                await ws.send_text(
+                    json.dumps(
+                        {
+                            "type": "audio_start",
+                            "sample_rate": tts_backend.sample_rate,
+                            "sentence_count": len(sentences),
+                        }
+                    )
+                )
 
                 for i, sentence in enumerate(sentences):
                     if interrupted.is_set():
                         print(f"Interrupted during TTS (sentence {i+1}/{len(sentences)})")
                         break
 
-                    # Generate audio for this sentence
-                    pcm = await asyncio.get_event_loop().run_in_executor(
-                        None, lambda s=sentence: tts_backend.generate(s)
-                    )
+                    try:
+                        pcm = await asyncio.wait_for(
+                            loop.run_in_executor(
+                                None, lambda s=sentence: tts_backend.generate(s)
+                            ),
+                            timeout=60.0,
+                        )
+                    except asyncio.TimeoutError:
+                        print(f"Parlor: TTS timed out on sentence {i+1}")
+                        interrupted.set()
+                        break
 
                     if interrupted.is_set():
                         break
 
-                    # Convert to 16-bit PCM and send as base64
                     pcm_int16 = (pcm * 32767).clip(-32768, 32767).astype(np.int16)
-                    await ws.send_text(json.dumps({
-                        "type": "audio_chunk",
-                        "audio": base64.b64encode(pcm_int16.tobytes()).decode(),
-                        "index": i,
-                    }))
+                    await ws.send_text(
+                        json.dumps(
+                            {
+                                "type": "audio_chunk",
+                                "audio": base64.b64encode(pcm_int16.tobytes()).decode(),
+                                "index": i,
+                            }
+                        )
+                    )
 
                 tts_time = time.time() - tts_start
                 print(f"TTS ({tts_time:.2f}s): {len(sentences)} sentences")
 
-                if not interrupted.is_set():
-                    await ws.send_text(json.dumps({
-                        "type": "audio_end",
-                        "tts_time": round(tts_time, 2),
-                    }))
+                if interrupted.is_set():
+                    await ws.send_text(
+                        json.dumps(
+                            {
+                                "type": "audio_end",
+                                "tts_time": round(tts_time, 2),
+                                "cancelled": True,
+                            }
+                        )
+                    )
+                else:
+                    await ws.send_text(
+                        json.dumps(
+                            {
+                                "type": "audio_end",
+                                "tts_time": round(tts_time, 2),
+                            }
+                        )
+                    )
 
             finally:
                 for p in [audio_path, image_path]:

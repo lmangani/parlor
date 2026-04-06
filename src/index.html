@@ -390,6 +390,93 @@
     border-color: rgba(74,222,128,0.15);
   }
 
+  .ctrl-btn:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+    pointer-events: none;
+  }
+
+  .text-input-row {
+    width: 100%;
+    max-width: 640px;
+    display: flex;
+    gap: 8px;
+    align-items: stretch;
+    flex-shrink: 0;
+    margin-top: 10px;
+    padding: 0 4px;
+  }
+
+  .text-input-row input[type="text"] {
+    flex: 1;
+    min-width: 0;
+    font-family: var(--font-body);
+    font-size: 13px;
+    padding: 10px 12px;
+    border-radius: 10px;
+    border: 1px solid rgba(255,255,255,0.08);
+    background: var(--c-surface);
+    color: var(--c-text-bright);
+    outline: none;
+  }
+
+  .text-input-row input[type="text"]::placeholder {
+    color: var(--c-text-dim);
+  }
+
+  .text-input-row input[type="text"]:focus {
+    border-color: rgba(74,222,128,0.25);
+  }
+
+  .text-input-row button.send-text {
+    flex-shrink: 0;
+    padding: 10px 18px;
+  }
+
+  .modality-bar {
+    width: 100%;
+    max-width: 640px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    flex-shrink: 0;
+    margin-top: 10px;
+    padding: 0 4px;
+  }
+
+  .modality-label {
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--c-text-dim);
+  }
+
+  button.mini-toggle {
+    font-family: var(--font-body);
+    font-size: 11px;
+    font-weight: 600;
+    padding: 6px 12px;
+    border-radius: 8px;
+    border: 1px solid rgba(255,255,255,0.1);
+    background: rgba(255,255,255,0.03);
+    color: var(--c-text-dim);
+    cursor: pointer;
+    transition: background 0.2s, color 0.2s, border-color 0.2s;
+  }
+
+  button.mini-toggle:hover {
+    background: var(--c-surface-hover);
+    color: var(--c-text);
+  }
+
+  button.mini-toggle.active {
+    background: var(--c-listen-dim);
+    color: var(--c-listen);
+    border-color: rgba(74,222,128,0.25);
+  }
+
   .state-indicator {
     display: flex;
     align-items: center;
@@ -444,8 +531,19 @@
     <canvas id="waveform"></canvas>
   </div>
 
+  <div class="modality-bar" title="Controls what is sent to the model (faster when off)">
+    <span class="modality-label">To model</span>
+    <button type="button" id="toggleModelVision" class="mini-toggle active" aria-pressed="true">Vision</button>
+    <button type="button" id="toggleModelMic" class="mini-toggle active" aria-pressed="true">Mic</button>
+  </div>
+
   <!-- Transcript -->
   <div id="messages" class="transcript"></div>
+
+  <div class="text-input-row">
+    <input type="text" id="textInput" placeholder="Type a message (or use voice)…" autocomplete="off" />
+    <button type="button" id="sendTextBtn" class="ctrl-btn send-text">Send</button>
+  </div>
 
   <!-- Controls -->
   <div class="controls">
@@ -472,12 +570,27 @@ const stateDot = $('stateDot'), stateText = $('stateText');
 const viewportWrap = $('viewportWrap');
 const waveformCanvas = $('waveform');
 const waveformCtx = waveformCanvas.getContext('2d');
+const textInput = $('textInput');
+const sendTextBtn = $('sendTextBtn');
+const toggleModelVision = $('toggleModelVision');
+const toggleModelMic = $('toggleModelMic');
+
+/** When false, no camera frame is attached to the model (voice-only or text-only to LLM). */
+let sendVisionToModel = true;
+/** When false, VAD is off and voice is not sent; use typed text (optionally with vision). */
+let sendAudioToModel = true;
+
+/** Server LLM timeout (s) + buffer — must stay in sync with PARLOR_LLM_TIMEOUT_SEC */
+const CLIENT_RESPONSE_WATCHDOG_MS = 135000;
 
 let ws, mediaStream, myvad;
 let cameraEnabled = true;
 let audioCtx, currentSource;
 let state = 'loading';
 let ignoreIncomingAudio = false;
+let isSessionPaused = false;
+let responseWatchdog = null;
+let sessionInitialized = false;
 
 // Streaming audio playback state
 let streamSampleRate = 24000;
@@ -583,7 +696,7 @@ function setState(newState) {
     if (newState === 'paused') {
       pauseBtn.textContent = 'Resume';
       pauseBtn.classList.add('active');
-    } else if (newState === 'listening') {
+    } else {
       pauseBtn.textContent = 'Pause';
       pauseBtn.classList.remove('active');
     }
@@ -618,8 +731,8 @@ function setState(newState) {
     myvad.setOptions({ positiveSpeechThreshold: newState === 'speaking' ? 0.92 : 0.5 });
   }
 
-  // Connect/disconnect mic analyser based on state
-  if (newState === 'listening' && mediaStream && audioCtx && analyser) {
+  // Connect/disconnect mic analyser based on state (only when mic feeds the model)
+  if (newState === 'listening' && sendAudioToModel && mediaStream && audioCtx && analyser) {
     if (!micSource) {
       micSource = audioCtx.createMediaStreamSource(mediaStream);
     }
@@ -629,12 +742,133 @@ function setState(newState) {
   }
 }
 
+function clearResponseWatchdog() {
+  if (responseWatchdog) {
+    clearTimeout(responseWatchdog);
+    responseWatchdog = null;
+  }
+}
+
+function startResponseWatchdog() {
+  clearResponseWatchdog();
+  responseWatchdog = setTimeout(() => {
+    responseWatchdog = null;
+    if (state === 'processing') {
+      console.warn('Parlor: response watchdog fired');
+      setState('listening');
+      setStatus('connected', 'Connected');
+      addMessage('assistant', 'No response in time. Check the server or try again.', 'timeout');
+    }
+  }, CLIENT_RESPONSE_WATCHDOG_MS);
+}
+
+async function teardownVAD() {
+  if (!myvad) return;
+  try {
+    myvad.pause();
+    await myvad.destroy();
+  } catch (e) {
+    console.warn('VAD teardown:', e);
+  }
+  myvad = null;
+}
+
+function stopMediaTracks() {
+  if (mediaStream) {
+    mediaStream.getTracks().forEach(t => {
+      try { t.stop(); } catch (_) {}
+    });
+    mediaStream = null;
+  }
+  video.srcObject = null;
+}
+
+async function setupVAD() {
+  if (!sendAudioToModel) {
+    await teardownVAD();
+    return;
+  }
+  if (!mediaStream || !mediaStream.getAudioTracks().length) {
+    console.warn('setupVAD: no audio track');
+    return;
+  }
+  await teardownVAD();
+  myvad = await vad.MicVAD.new({
+    getStream: async () => new MediaStream(mediaStream.getAudioTracks()),
+    positiveSpeechThreshold: 0.5,
+    negativeSpeechThreshold: 0.25,
+    redemptionMs: 600,
+    minSpeechMs: 300,
+    preSpeechPadMs: 300,
+    onSpeechStart: handleSpeechStart,
+    onSpeechEnd: handleSpeechEnd,
+    onVADMisfire: () => { console.log('VAD misfire (too short)'); },
+    onnxWASMBasePath: "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/",
+    baseAssetPath: "https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.29/dist/",
+  });
+  myvad.start();
+}
+
+async function pauseSession(fromVisibility = false) {
+  if (state === 'loading') return;
+  if (isSessionPaused) return;
+
+  isSessionPaused = true;
+  stopPlayback();
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    try { ws.send(JSON.stringify({ type: 'interrupt' })); } catch (_) {}
+  }
+
+  await teardownVAD();
+
+  if (micSource) {
+    try { micSource.disconnect(); } catch (_) {}
+    micSource = null;
+  }
+
+  stopMediaTracks();
+  clearResponseWatchdog();
+
+  setState('paused');
+  const label = fromVisibility ? 'Paused · tab in background' : 'Paused · mic & camera off';
+  setStatus('connected', label);
+}
+
+async function resumeSession() {
+  if (!isSessionPaused) return;
+
+  isSessionPaused = false;
+
+  try {
+    await startCamera();
+  } catch (e) {
+    console.error('resume camera/mic:', e);
+    isSessionPaused = true;
+    setStatus('disconnected', 'Mic/camera blocked');
+    setState('paused');
+    return;
+  }
+
+  await setupVAD();
+  ensureAudioCtx();
+  if (audioCtx && audioCtx.state === 'suspended') await audioCtx.resume();
+
+  const ok = ws && ws.readyState === WebSocket.OPEN;
+  setState('listening');
+  setStatus(ok ? 'connected' : 'disconnected', ok ? 'Connected' : 'Disconnected');
+}
+
+async function togglePause() {
+  if (isSessionPaused) await resumeSession();
+  else await pauseSession(false);
+}
+
 // ── WebSocket ──
 function connect() {
   ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`);
   ws.onopen = () => {
     setStatus('connected', 'Connected');
-    if (state !== 'loading') setState('listening');
+    if (!isSessionPaused && state !== 'loading') setState('listening');
   };
   ws.onclose = () => {
     setStatus('disconnected', 'Disconnected');
@@ -643,6 +877,18 @@ function connect() {
   ws.onmessage = ({ data }) => {
     const msg = JSON.parse(data);
     if (msg.type === 'text') {
+      clearResponseWatchdog();
+      if (msg.cancelled) {
+        setState(isSessionPaused ? 'paused' : 'listening');
+        if (!isSessionPaused) setStatus('connected', 'Connected');
+        return;
+      }
+      if (msg.error) {
+        addMessage('assistant', msg.text, msg.llm_time != null ? `LLM ${msg.llm_time}s` : '');
+        setState(isSessionPaused ? 'paused' : 'listening');
+        if (!isSessionPaused) setStatus('connected', 'Connected');
+        return;
+      }
       if (msg.transcription) {
         const userMsgs = messagesDiv.querySelectorAll('.msg.user');
         const lastUserMsg = userMsgs[userMsgs.length - 1];
@@ -653,17 +899,25 @@ function connect() {
       }
       addMessage('assistant', msg.text, `LLM ${msg.llm_time}s`);
     } else if (msg.type === 'audio_start') {
-      if (ignoreIncomingAudio) return;
+      if (ignoreIncomingAudio || isSessionPaused) return;
       streamSampleRate = msg.sample_rate || 24000;
       startStreamPlayback();
     } else if (msg.type === 'audio_chunk') {
-      if (ignoreIncomingAudio) return;
+      if (ignoreIncomingAudio || isSessionPaused) return;
       queueAudioChunk(msg.audio);
     } else if (msg.type === 'audio_end') {
+      clearResponseWatchdog();
       if (ignoreIncomingAudio) {
         ignoreIncomingAudio = false;
         stopPlayback();
-        setState('listening');
+        setState(isSessionPaused ? 'paused' : 'listening');
+        if (!isSessionPaused) setStatus('connected', 'Connected');
+        return;
+      }
+      if (msg.cancelled) {
+        stopPlayback();
+        setState(isSessionPaused ? 'paused' : 'listening');
+        if (!isSessionPaused) setStatus('connected', 'Connected');
         return;
       }
       streamTtsTime = msg.tts_time;
@@ -696,8 +950,32 @@ async function startCamera() {
   if (!mediaStream.getAudioTracks().length) { cameraEnabled = false; }
 }
 
+function syncModalityToggleButtons() {
+  if (toggleModelVision) {
+    toggleModelVision.classList.toggle('active', sendVisionToModel);
+    toggleModelVision.setAttribute('aria-pressed', String(sendVisionToModel));
+  }
+  if (toggleModelMic) {
+    toggleModelMic.classList.toggle('active', sendAudioToModel);
+    toggleModelMic.setAttribute('aria-pressed', String(sendAudioToModel));
+  }
+}
+
+function updateInputPlaceholder() {
+  if (!textInput) return;
+  if (sendAudioToModel && sendVisionToModel) {
+    textInput.placeholder = 'Type a message (or use voice)…';
+  } else if (sendAudioToModel) {
+    textInput.placeholder = 'Type a message, or speak (vision off — faster)…';
+  } else if (sendVisionToModel) {
+    textInput.placeholder = 'Type a message (mic off — camera may attach)…';
+  } else {
+    textInput.placeholder = 'Type a message (text only to the model)…';
+  }
+}
+
 function captureFrame() {
-  if (!cameraEnabled || !video.videoWidth) return null;
+  if (!sendVisionToModel || !cameraEnabled || !video.videoWidth) return null;
   const canvas = document.createElement('canvas');
   const scale = 320 / video.videoWidth;
   canvas.width = 320; canvas.height = video.videoHeight * scale;
@@ -710,6 +988,7 @@ let speakingStartedAt = 0;
 const BARGE_IN_GRACE_MS = 800; // Ignore VAD triggers shortly after TTS starts (echo)
 
 function handleSpeechStart() {
+  if (isSessionPaused || !sendAudioToModel) return;
   if (state === 'speaking') {
     // Ignore echo: don't allow barge-in right after TTS starts playing
     if (Date.now() - speakingStartedAt < BARGE_IN_GRACE_MS) {
@@ -727,15 +1006,18 @@ function handleSpeechStart() {
 }
 
 function handleSpeechEnd(audio) {
+  if (isSessionPaused || !sendAudioToModel) return;
   if (state !== 'listening') return;
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
 
   const wavBase64 = float32ToWavBase64(audio);
   const imageBase64 = captureFrame();
+  const metaVoice = imageBase64 ? 'voice · camera' : 'voice only';
 
   setState('processing');
   setStatus('processing', 'Processing');
-  addMessage('user', '<span class="loading-dots"><span></span><span></span><span></span></span>', imageBase64 ? 'with camera' : '');
+  startResponseWatchdog();
+  addMessage('user', '<span class="loading-dots"><span></span><span></span><span></span></span>', metaVoice);
 
   const payload = { audio: wavBase64 };
   if (imageBase64) payload.image = imageBase64;
@@ -823,8 +1105,10 @@ function queueAudioChunk(base64Pcm) {
     // If this was the last chunk and no more are queued, return to listening
     if (streamSources.length === 0 && state === 'speaking') {
       currentSource = null;
-      setState('listening');
-      setStatus('connected', 'Connected');
+      if (!isSessionPaused) {
+        setState('listening');
+        setStatus('connected', 'Connected');
+      }
     }
   };
 }
@@ -845,11 +1129,56 @@ cameraToggle.addEventListener('click', () => {
   video.style.opacity = cameraEnabled ? 1 : 0.3;
 });
 
-pauseBtn.addEventListener('click', () => {
-  if (state === 'listening') {
-    setState('paused');
-  } else if (state === 'paused') {
-    setState('listening');
+toggleModelVision.addEventListener('click', () => {
+  sendVisionToModel = !sendVisionToModel;
+  syncModalityToggleButtons();
+  updateInputPlaceholder();
+});
+
+toggleModelMic.addEventListener('click', async () => {
+  sendAudioToModel = !sendAudioToModel;
+  if (!sendAudioToModel) {
+    await teardownVAD();
+    if (micSource && analyser) {
+      try { micSource.disconnect(analyser); } catch (_) {}
+    }
+    micSource = null;
+  } else if (!isSessionPaused) {
+    await setupVAD();
+  }
+  syncModalityToggleButtons();
+  updateInputPlaceholder();
+  if (!isSessionPaused) setState(state);
+});
+
+pauseBtn.addEventListener('click', () => { togglePause(); });
+
+function sendTextMessage() {
+  const t = textInput.value.trim();
+  if (!t) return;
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  textInput.value = '';
+  const payload = { text: t };
+  let meta = 'typed';
+  if (sendVisionToModel) {
+    const img = captureFrame();
+    if (img) {
+      payload.image = img;
+      meta = 'typed · camera';
+    }
+  }
+  addMessage('user', t, meta);
+  setState('processing');
+  setStatus('processing', 'Processing');
+  startResponseWatchdog();
+  ws.send(JSON.stringify(payload));
+}
+
+sendTextBtn.addEventListener('click', sendTextMessage);
+textInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    sendTextMessage();
   }
 });
 
@@ -861,22 +1190,12 @@ async function init() {
   await startCamera();
   connect();
 
-  // Initialize VAD with shared mic stream
-  myvad = await vad.MicVAD.new({
-    getStream: async () => new MediaStream(mediaStream.getAudioTracks()),
-    positiveSpeechThreshold: 0.5,
-    negativeSpeechThreshold: 0.25,
-    redemptionMs: 600,
-    minSpeechMs: 300,
-    preSpeechPadMs: 300,
-    onSpeechStart: handleSpeechStart,
-    onSpeechEnd: handleSpeechEnd,
-    onVADMisfire: () => { console.log('VAD misfire (too short)'); },
-    onnxWASMBasePath: "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/",
-    baseAssetPath: "https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.29/dist/",
-  });
+  await setupVAD();
 
-  myvad.start();
+  document.addEventListener('visibilitychange', () => {
+    if (!sessionInitialized) return;
+    if (document.hidden) pauseSession(true);
+  });
 
   // Init audio context on first user gesture for mic visualizer
   // (browsers require user interaction to create AudioContext)
@@ -891,12 +1210,20 @@ async function init() {
   // Also try immediately (may work if page had prior interaction)
   ensureAudioCtx();
 
-  setState('listening');
+  sessionInitialized = true;
+  if (document.hidden) {
+    await pauseSession(true);
+  } else {
+    setState('listening');
+  }
 
   // Start waveform loop
   drawWaveform();
 
-  console.log('VAD initialized and listening');
+  syncModalityToggleButtons();
+  updateInputPlaceholder();
+
+  console.log(sendAudioToModel ? 'VAD initialized and listening' : 'Mic to model off — voice disabled');
 }
 
 init();
