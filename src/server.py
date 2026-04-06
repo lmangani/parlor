@@ -53,26 +53,44 @@ def build_system_prompt() -> str:
         "You are a friendly, conversational AI assistant. The user is talking to you "
         "through a microphone and showing you their camera.",
         "",
-        "You can use these tools:",
+        "You use tools in two stages: (1) gather facts if needed, (2) deliver your reply.",
+        "",
+        "Tools:",
     ]
+    if ENABLE_WEB_SEARCH:
+        lines.extend(
+            [
+                "- web_search: Your main way to learn about the real world. Use it whenever the user "
+                "asks about news, weather, sports, stocks, people, places, products, events, "
+                '"what happened", "who won", definitions, or anything you are not 100% sure about. '
+                "Prefer searching over inventing facts. Pass a short keyword query (you may call "
+                "it more than once with different queries).",
+                "",
+            ]
+        )
     if ENABLE_UTC_TIME:
         lines.append(
             "- get_current_utc_time: use when the user asks for the current date, day, or time."
         )
-    if ENABLE_WEB_SEARCH:
-        lines.append(
-            "- web_search: use for news, weather, sports scores, stock prices, or any fact "
-            "that may be outdated or needs verification online. Pass a short, focused query."
-        )
     lines.extend(
         [
-            "- respond_to_user: REQUIRED for every reply. Pass transcription (exact words the "
-            "user said in the audio) and response (your 1–4 short sentences for voice).",
+            "- respond_to_user: REQUIRED last step on every turn. Pass transcription (exact words "
+            "the user said in the audio) and response (your 1–4 short sentences for voice).",
             "",
-            "Call utility tools first if needed, then always finish with respond_to_user. "
-            "Do not answer the user with plain text only — use respond_to_user.",
         ]
     )
+    if ENABLE_WEB_SEARCH:
+        lines.append(
+            "Workflow: If the user's request benefits from online facts, call web_search first, read "
+            "the tool result, then call respond_to_user with what they said and your answer. "
+            "For pure small talk with no factual lookup, you may call respond_to_user directly. "
+            "Never output a normal assistant message without using respond_to_user."
+        )
+    else:
+        lines.append(
+            "Workflow: Call respond_to_user with what they said and your answer. "
+            "Never output a normal assistant message without using respond_to_user."
+        )
     return "\n".join(lines)
 
 
@@ -215,12 +233,42 @@ async def websocket_endpoint(ws: WebSocket):
                 if image_path:
                     content.append({"type": "image", "path": os.path.abspath(image_path)})
 
+                search_hint = ""
+                if ENABLE_WEB_SEARCH:
+                    search_hint = (
+                        " If their question needs real-world facts (news, people, places, scores, "
+                        "weather, dates, or anything to verify online), call web_search with a "
+                        "short query before you call respond_to_user."
+                    )
+
                 if audio_path and image_path:
-                    content.append({"type": "text", "text": "The user just spoke to you (audio) while showing their camera (image). Respond to what they said, referencing what you see if relevant."})
+                    content.append(
+                        {
+                            "type": "text",
+                            "text": (
+                                "The user just spoke to you (audio) while showing their camera (image). "
+                                "Respond to what they said, referencing what you see if relevant."
+                                + search_hint
+                            ),
+                        }
+                    )
                 elif audio_path:
-                    content.append({"type": "text", "text": "The user just spoke to you. Respond to what they said."})
+                    content.append(
+                        {
+                            "type": "text",
+                            "text": "The user just spoke to you. Respond to what they said." + search_hint,
+                        }
+                    )
                 elif image_path:
-                    content.append({"type": "text", "text": "The user is showing you their camera. Describe what you see."})
+                    content.append(
+                        {
+                            "type": "text",
+                            "text": (
+                                "The user is showing you their camera. Describe what you see."
+                                + search_hint
+                            ),
+                        }
+                    )
                 else:
                     content.append({"type": "text", "text": msg.get("text", "Hello!")})
 

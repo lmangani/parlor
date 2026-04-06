@@ -2,13 +2,37 @@
 
 from __future__ import annotations
 
+import html as html_lib
 import json
 import os
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from typing import Any
+
+# Gemma / LiteRT may emit different JSON keys for the search string.
+_SEARCH_ARG_KEYS = (
+    "query",
+    "q",
+    "search_query",
+    "topic",
+    "keywords",
+    "search",
+    "text",
+    "question",
+)
+
+
+def extract_search_query(args: dict[str, Any]) -> str | None:
+    if not isinstance(args, dict):
+        return None
+    for key in _SEARCH_ARG_KEYS:
+        v = args.get(key)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return None
 
 DEFAULT_TIMEOUT_S = float(os.environ.get("PARLOR_HTTP_TIMEOUT", "12"))
 MAX_QUERY_LEN = int(os.environ.get("PARLOR_MAX_SEARCH_QUERY_LEN", "240"))
@@ -52,6 +76,55 @@ def _duckduckgo_instant(query: str) -> str:
     return _format_duckduckgo_instant(j)
 
 
+def _strip_tags(fragment: str) -> str:
+    t = re.sub(r"<[^>]+>", " ", fragment)
+    return html_lib.unescape(re.sub(r"\s+", " ", t).strip())
+
+
+def _duckduckgo_html(query: str) -> str:
+    """HTML results when the instant-answer API has little text (broader coverage)."""
+    body = urllib.parse.urlencode({"q": query}).encode()
+    url = "https://html.duckduckgo.com/html/"
+    req = urllib.request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={
+            "User-Agent": _USER_AGENT,
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=DEFAULT_TIMEOUT_S) as resp:
+        html = resp.read(MAX_WEB_BODY_BYTES).decode("utf-8", errors="replace")
+    lines: list[str] = []
+    seen: set[str] = set()
+    for pat in (
+        r'class="result__a"[^>]*>([^<]+)</a>',
+        r'class="result__title"[^>]*>\s*<a[^>]*>([^<]+)</a>',
+        r'rel="nofollow"[^>]*class="[^"]*result-link[^"]*"[^>]*>([^<]+)</a>',
+    ):
+        for m in re.finditer(pat, html, re.I):
+            title = _strip_tags(m.group(1))
+            if len(title) < 3 or title in seen:
+                continue
+            seen.add(title)
+            lines.append(f"• {title}")
+            if len(lines) >= 10:
+                break
+        if len(lines) >= 6:
+            break
+    for m in re.finditer(r'class="result__snippet"[^>]*>([^<]+(?:<[^/][^<]*</[^>]+>[^<]+)*)', html):
+        snip = _strip_tags(m.group(1))
+        if len(snip) > 40:
+            key = snip[:80]
+            if key not in seen:
+                seen.add(key)
+                lines.append(snip)
+        if len(lines) >= 12:
+            break
+    return "\n".join(lines)
+
+
 def _wikipedia_snippets(query: str) -> str:
     base = "https://en.wikipedia.org/w/api.php"
     q = urllib.parse.quote(query[:120])
@@ -78,33 +151,70 @@ def _wikipedia_snippets(query: str) -> str:
     return ""
 
 
-def web_search(query: str) -> str:
-    """Look up current or general knowledge using DuckDuckGo and Wikipedia.
+def web_search(
+    query: str | None = None,
+    q: str | None = None,
+    search_query: str | None = None,
+    topic: str | None = None,
+    keywords: str | None = None,
+    search: str | None = None,
+    text: str | None = None,
+    question: str | None = None,
+) -> str:
+    """Search the public web for real-world facts—use often, not only as a last resort.
 
-    Use when the user asks for recent events, facts you are unsure about,
-    weather, prices, or anything that benefits from a quick web lookup.
+    Call this when the user asks about news, weather, sports, people, places, products,
+    dates of events, definitions, or anything that should be checked online. Use short
+    keyword-style queries; you can call it more than once with refined queries if needed.
 
     Args:
-        query: A focused search query (people, places, topics, questions).
+        query: Main search string (preferred). Same meaning as q, topic, or question.
+        q: Alternate name for the search string.
+        search_query: Alternate name for the search string.
+        topic: Alternate name for the search string.
+        keywords: Alternate name for the search string.
+        search: Alternate name for the search string.
+        text: Alternate name for the search string.
+        question: Alternate name for the search string.
     """
-    q = (query or "").strip()
-    if not q:
-        return "Empty search query."
-    if len(q) > MAX_QUERY_LEN:
-        q = q[:MAX_QUERY_LEN]
+    args = {
+        "query": query,
+        "q": q,
+        "search_query": search_query,
+        "topic": topic,
+        "keywords": keywords,
+        "search": search,
+        "text": text,
+        "question": question,
+    }
+    raw_q = extract_search_query(args)
+    if not raw_q:
+        return "No search terms were provided. Call web_search again with a non-empty query."
+    qn = raw_q
+    if len(qn) > MAX_QUERY_LEN:
+        qn = qn[:MAX_QUERY_LEN]
 
     parts: list[str] = []
     try:
-        ddg = _duckduckgo_instant(q)
+        ddg = _duckduckgo_instant(qn)
         if ddg:
-            parts.append("[DuckDuckGo]\n" + ddg)
+            parts.append("[DuckDuckGo instant]\n" + ddg)
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as e:
-        parts.append(f"[DuckDuckGo failed: {e}]")
+        parts.append(f"[DuckDuckGo instant failed: {e}]")
+
+    combined = "\n\n".join(parts)
+    if len(combined.strip()) < 160:
+        try:
+            html_hits = _duckduckgo_html(qn)
+            if html_hits:
+                parts.append("[DuckDuckGo web results]\n" + html_hits)
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            parts.append(f"[DuckDuckGo HTML failed: {e}]")
 
     combined = "\n\n".join(parts)
     if len(combined.strip()) < 120:
         try:
-            wiki = _wikipedia_snippets(q)
+            wiki = _wikipedia_snippets(qn)
             if wiki:
                 parts.append("[Wikipedia]\n" + wiki)
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as e:

@@ -8,7 +8,7 @@ from typing import Any
 
 import litert_lm
 
-from agent_tools import MAX_QUERY_LEN
+from agent_tools import MAX_QUERY_LEN, extract_search_query
 
 MAX_TOOL_RESPONSE_CHARS = 8000
 
@@ -27,18 +27,27 @@ def extract_tool_name(tool_call: dict[str, Any]) -> str | None:
 def extract_tool_arguments(tool_call: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(tool_call, dict):
         return {}
+    merged: dict[str, Any] = {}
+
+    top_args = tool_call.get("args")
+    if isinstance(top_args, dict):
+        merged.update(top_args)
+
     raw = tool_call.get("arguments")
-    if raw is None and isinstance(tool_call.get("function"), dict):
-        raw = tool_call["function"].get("arguments")
+    fn = tool_call.get("function")
+    if raw is None and isinstance(fn, dict):
+        raw = fn.get("arguments")
     if isinstance(raw, str):
         try:
             parsed = json.loads(raw)
-            return parsed if isinstance(parsed, dict) else {}
+            if isinstance(parsed, dict):
+                merged.update(parsed)
         except json.JSONDecodeError:
-            return {}
-    if isinstance(raw, dict):
-        return raw
-    return {}
+            pass
+    elif isinstance(raw, dict):
+        merged.update(raw)
+
+    return merged
 
 
 def _truncate_value(obj: Any, max_str: int) -> Any:
@@ -73,12 +82,12 @@ class ParlorToolPolicy(litert_lm.ToolEventHandler):
 
         args = extract_tool_arguments(tool_call)
         if name == "web_search":
-            q = args.get("query", "")
-            if not isinstance(q, str):
-                print("web_search denied: query must be a string")
-                return False
-            if not q.strip():
-                print("web_search denied: empty query")
+            q = extract_search_query(args)
+            if not q:
+                print(
+                    "web_search denied: no usable string in arguments; keys=",
+                    list(args.keys()),
+                )
                 return False
             if len(q) > MAX_QUERY_LEN + 20:
                 print("web_search denied: query too long")
@@ -96,12 +105,12 @@ def build_optional_tools(
     enable_web_search: bool,
     enable_utc_time: bool,
 ) -> list[Any]:
-    """Returns module-level tool callables to pass to create_conversation (order: utilities first)."""
+    """Tool order: web_search before time so the schema highlights search for factual turns."""
     from agent_tools import get_current_utc_time, web_search
 
     tools: list[Any] = []
-    if enable_utc_time:
-        tools.append(get_current_utc_time)
     if enable_web_search:
         tools.append(web_search)
+    if enable_utc_time:
+        tools.append(get_current_utc_time)
     return tools
