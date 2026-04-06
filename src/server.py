@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import functools
 import json
 import os
 import re
@@ -47,6 +48,39 @@ def _optional_tool_flags() -> tuple[bool, bool]:
 
 
 ENABLE_WEB_SEARCH, ENABLE_UTC_TIME = _optional_tool_flags()
+
+SEARCH_MEMORY_CAP = int(os.environ.get("PARLOR_SEARCH_MEMORY_CHARS", "9000"))
+
+
+def _make_web_search_with_memory(memory: dict[str, str]):
+    """Wrap web_search to retain the latest query + body for injected session context."""
+
+    @functools.wraps(agent_tools.web_search)
+    def web_search_with_memory(**kwargs):
+        out = agent_tools.web_search(**kwargs)
+        if isinstance(out, str) and out.strip():
+            q = agent_tools.extract_search_query(kwargs)
+            memory["query"] = (q or "—")[: agent_tools.MAX_QUERY_LEN]
+            memory["text"] = out[:SEARCH_MEMORY_CAP]
+        return out
+
+    return web_search_with_memory
+
+
+def _user_text_search_memory_append(memory: dict[str, str]) -> str:
+    """Re-inject last search results into every user turn (model does not read server logs)."""
+    t = (memory.get("text") or "").strip()
+    if not t:
+        return ""
+    q = (memory.get("query") or "").strip()
+    return (
+        "\n\n---\n[Latest web_search snapshot for this session — treat as ground truth for "
+        "follow-ups: numbered results, first vs second link, hostnames, paths, and snippets.]\n"
+        f"Query: {q}\n---\n{t}\n---\n"
+        "If something the user asks is not covered here, or they need verification or fresher "
+        "information, call web_search again with a targeted query before respond_to_user. "
+        "Never guess URLs.\n---"
+    )
 
 
 def build_system_prompt() -> str:
@@ -94,11 +128,21 @@ def build_system_prompt() -> str:
         ]
     )
     if ENABLE_WEB_SEARCH:
-        lines.append(
-            "Workflow: If the user's request benefits from online facts, call web_search first, read "
-            "the tool result, then call respond_to_user with what they said and your answer. "
-            "For pure small talk with no factual lookup, you may call respond_to_user directly. "
-            "Never output a normal assistant message without using respond_to_user."
+        lines.extend(
+            [
+                "Session search memory: The user message may include a [Latest web_search snapshot] "
+                "block with the most recent successful web_search for this connection. Prefer it "
+                "for follow-ups (first result, that site, read this URL) so you keep exact links and "
+                "ordering even if the chat transcript is lossy.",
+                "",
+                "Follow-ups: Use the snapshot plus chat history. If the snapshot lacks what you "
+                "need, or the user wants new or updated web facts, call web_search again, then "
+                "respond_to_user.",
+                "",
+                "Workflow: When you need web facts, call web_search, read the tool result, then "
+                "call respond_to_user. For small talk with no web need, respond_to_user only. "
+                "Never output plain assistant text without respond_to_user.",
+            ]
         )
     else:
         lines.append(
@@ -179,7 +223,6 @@ def _looks_like_leaked_tool_output(s: str | None) -> bool:
         "<|tool_call",
         "<tool_call",
         "call:respond_to_user",
-        "<|turn|>",
         "<|channel|>",
         "display_context:<|",
         "<tool_response",
@@ -219,6 +262,11 @@ _CONVERSATION_RESET_MESSAGE = (
     "I hit a snag formatting that answer. Let's continue—what would you like to know?"
 )
 
+_EMPTY_ASSISTANT_RETRY_MESSAGE = (
+    "I didn't quite catch that—could you say it again in a few words? "
+    "For example, 'pick the first recipe you found,' or 'read out that link.'"
+)
+
 
 @app.get("/")
 async def root():
@@ -232,6 +280,7 @@ async def websocket_endpoint(ws: WebSocket):
     # Per-connection tool state captured via closure
     tool_result = {}
     tool_trace: list[str] = []
+    search_memory: dict[str, str] = {"query": "", "text": ""}
 
     def respond_to_user(
         transcription: str,
@@ -252,9 +301,13 @@ async def websocket_endpoint(ws: WebSocket):
         tool_result["display_context"] = display_context
         return "OK"
 
+    web_search_impl = (
+        _make_web_search_with_memory(search_memory) if ENABLE_WEB_SEARCH else None
+    )
     optional = build_optional_tools(
         enable_web_search=ENABLE_WEB_SEARCH,
         enable_utc_time=ENABLE_UTC_TIME,
+        web_search_impl=web_search_impl,
     )
     tool_functions = [*optional, respond_to_user]
     allowed_names = frozenset({f.__name__ for f in tool_functions})
@@ -321,14 +374,16 @@ async def websocket_endpoint(ws: WebSocket):
                 if image_path:
                     content.append({"type": "image", "path": os.path.abspath(image_path)})
 
+                memory_append = _user_text_search_memory_append(search_memory)
                 search_hint = ""
                 if ENABLE_WEB_SEARCH:
                     search_hint = (
-                        " If their question needs real-world facts (news, people, places, scores, "
-                        "weather, dates, or anything to verify online), call web_search with a "
-                        "short query before you call respond_to_user. Summarize what you learned in "
-                        "display_context (links, bullets) and keep response short for voice."
+                        " If this message includes [Latest web_search snapshot], use it for follow-ups "
+                        "(first link, that recipe, named sites, exact URLs). If something is still "
+                        "missing or the user wants new or updated web information, call web_search, "
+                        "then respond_to_user. Put URLs and bullets in display_context; keep voice concise."
                     )
+                tail = memory_append + search_hint
 
                 if audio_path and image_path:
                     content.append(
@@ -337,7 +392,7 @@ async def websocket_endpoint(ws: WebSocket):
                             "text": (
                                 "The user just spoke to you (audio) while showing their camera (image). "
                                 "Respond to what they said, referencing what you see if relevant."
-                                + search_hint
+                                + tail
                             ),
                         }
                     )
@@ -345,7 +400,7 @@ async def websocket_endpoint(ws: WebSocket):
                     content.append(
                         {
                             "type": "text",
-                            "text": "The user just spoke to you. Respond to what they said." + search_hint,
+                            "text": "The user just spoke to you. Respond to what they said." + tail,
                         }
                     )
                 elif image_path:
@@ -353,13 +408,17 @@ async def websocket_endpoint(ws: WebSocket):
                         {
                             "type": "text",
                             "text": (
-                                "The user is showing you their camera. Describe what you see."
-                                + search_hint
+                                "The user is showing you their camera. Describe what you see." + tail
                             ),
                         }
                     )
                 else:
-                    content.append({"type": "text", "text": msg.get("text", "Hello!")})
+                    content.append(
+                        {
+                            "type": "text",
+                            "text": (msg.get("text", "Hello!") + tail),
+                        }
+                    )
 
                 # LLM inference
                 t0 = time.time()
@@ -392,8 +451,16 @@ async def websocket_endpoint(ws: WebSocket):
                     display_ctx = _scrub_tracking_urls(_sanitize_parlor_output(display_ctx))
 
                     if not text_response and not display_ctx:
-                        needs_conversation_reset = True
-                        text_response = _CONVERSATION_RESET_MESSAGE
+                        had_tool_leak = (
+                            _looks_like_leaked_tool_output(tool_result.get("response"))
+                            or _looks_like_leaked_tool_output(tool_result.get("display_context"))
+                            or _looks_like_leaked_tool_output(tool_result.get("transcription"))
+                        )
+                        if had_tool_leak:
+                            needs_conversation_reset = True
+                            text_response = _CONVERSATION_RESET_MESSAGE
+                        else:
+                            text_response = _EMPTY_ASSISTANT_RETRY_MESSAGE
                         skip_audio = False
                     else:
                         skip_audio = not text_response and bool(display_ctx)
@@ -412,8 +479,8 @@ async def websocket_endpoint(ws: WebSocket):
                     else:
                         text_response = _scrub_tracking_urls(_sanitize_parlor_output(raw_text))
                         if not text_response.strip():
-                            needs_conversation_reset = True
-                            text_response = _CONVERSATION_RESET_MESSAGE
+                            # Empty or token-only decode (e.g. <|"|>)—keep conversation history.
+                            text_response = _EMPTY_ASSISTANT_RETRY_MESSAGE
                     print(f"LLM ({llm_time:.2f}s) [no tool] raw head: {raw_text[:160]!r}…")
 
                 if needs_conversation_reset:
