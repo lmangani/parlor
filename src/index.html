@@ -651,7 +651,11 @@ function connect() {
           lastUserMsg.innerHTML = `${msg.transcription}${meta ? meta.outerHTML : ''}`;
         }
       }
-      addMessage('assistant', msg.text, `LLM ${msg.llm_time}s`);
+      const used = Array.isArray(msg.tools_used)
+        ? msg.tools_used.filter((t) => t !== 'respond_to_user')
+        : [];
+      const toolsSuffix = used.length ? ` · ${used.join(', ')}` : '';
+      addMessage('assistant', msg.text, `LLM ${msg.llm_time}s${toolsSuffix}`);
     } else if (msg.type === 'audio_start') {
       if (ignoreIncomingAudio) return;
       streamSampleRate = msg.sample_rate || 24000;

@@ -18,6 +18,7 @@ from fastapi.responses import HTMLResponse
 
 import litert_lm
 import tts
+from tools_policy import ParlorToolPolicy, build_optional_tools
 
 HF_REPO = "litert-community/gemma-4-E2B-it-litert-lm"
 HF_FILENAME = "gemma-4-E2B-it.litertlm"
@@ -33,12 +34,49 @@ def resolve_model_path() -> str:
 
 
 MODEL_PATH = resolve_model_path()
-SYSTEM_PROMPT = (
-    "You are a friendly, conversational AI assistant. The user is talking to you "
-    "through a microphone and showing you their camera. "
-    "You MUST always use the respond_to_user tool to reply. "
-    "First transcribe exactly what the user said, then write your response."
-)
+
+
+def _optional_tool_flags() -> tuple[bool, bool]:
+    """PARLOR_TOOLS: comma-separated subset, or 'none', default enables web + time."""
+    raw = os.environ.get("PARLOR_TOOLS", "web_search,get_current_utc_time").strip().lower()
+    if raw == "none":
+        return False, False
+    parts = {p.strip() for p in raw.split(",") if p.strip()}
+    return "web_search" in parts, "get_current_utc_time" in parts
+
+
+ENABLE_WEB_SEARCH, ENABLE_UTC_TIME = _optional_tool_flags()
+
+
+def build_system_prompt() -> str:
+    lines = [
+        "You are a friendly, conversational AI assistant. The user is talking to you "
+        "through a microphone and showing you their camera.",
+        "",
+        "You can use these tools:",
+    ]
+    if ENABLE_UTC_TIME:
+        lines.append(
+            "- get_current_utc_time: use when the user asks for the current date, day, or time."
+        )
+    if ENABLE_WEB_SEARCH:
+        lines.append(
+            "- web_search: use for news, weather, sports scores, stock prices, or any fact "
+            "that may be outdated or needs verification online. Pass a short, focused query."
+        )
+    lines.extend(
+        [
+            "- respond_to_user: REQUIRED for every reply. Pass transcription (exact words the "
+            "user said in the audio) and response (your 1–4 short sentences for voice).",
+            "",
+            "Call utility tools first if needed, then always finish with respond_to_user. "
+            "Do not answer the user with plain text only — use respond_to_user.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+SYSTEM_PROMPT = build_system_prompt()
 
 SENTENCE_SPLIT_RE = re.compile(r'(?<=[.!?])\s+')
 
@@ -57,6 +95,10 @@ def load_models():
     )
     engine.__enter__()
     print("Engine loaded.")
+    print(
+        f"Agent tools (env PARLOR_TOOLS): web_search={ENABLE_WEB_SEARCH}, "
+        f"get_current_utc_time={ENABLE_UTC_TIME}"
+    )
 
     tts_backend = tts.load()
 
@@ -104,6 +146,7 @@ async def websocket_endpoint(ws: WebSocket):
 
     # Per-connection tool state captured via closure
     tool_result = {}
+    tool_trace: list[str] = []
 
     def respond_to_user(transcription: str, response: str) -> str:
         """Respond to the user's voice message.
@@ -116,9 +159,18 @@ async def websocket_endpoint(ws: WebSocket):
         tool_result["response"] = response
         return "OK"
 
+    optional = build_optional_tools(
+        enable_web_search=ENABLE_WEB_SEARCH,
+        enable_utc_time=ENABLE_UTC_TIME,
+    )
+    tool_functions = [*optional, respond_to_user]
+    allowed_names = frozenset({f.__name__ for f in tool_functions})
+    tool_policy = ParlorToolPolicy(allowed_names, tool_trace)
+
     conversation = engine.create_conversation(
         messages=[{"role": "system", "content": SYSTEM_PROMPT}],
-        tools=[respond_to_user],
+        tools=tool_functions,
+        tool_event_handler=tool_policy,
     )
     conversation.__enter__()
 
@@ -175,6 +227,7 @@ async def websocket_endpoint(ws: WebSocket):
                 # LLM inference
                 t0 = time.time()
                 tool_result.clear()
+                tool_trace.clear()
                 response = await asyncio.get_event_loop().run_in_executor(
                     None, lambda: conversation.send_message({"role": "user", "content": content})
                 )
@@ -198,6 +251,8 @@ async def websocket_endpoint(ws: WebSocket):
                 reply = {"type": "text", "text": text_response, "llm_time": round(llm_time, 2)}
                 if transcription:
                     reply["transcription"] = transcription
+                if tool_trace:
+                    reply["tools_used"] = list(tool_trace)
                 await ws.send_text(json.dumps(reply))
 
                 if interrupted.is_set():
