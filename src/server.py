@@ -47,9 +47,8 @@ MODEL_PATH = resolve_model_path()
 
 def _optional_tool_flags() -> tuple[bool, bool, bool]:
     """PARLOR_TOOLS: comma-separated subset, or 'none'. Default: lookup + read page + time."""
-    raw = os.environ.get(
-        "PARLOR_TOOLS", "web_search,read_web_page,get_current_utc_time"
-    ).strip().lower()
+    # read_web_page is optional: extra tool surface can worsen FC on small E2B; enable via env.
+    raw = os.environ.get("PARLOR_TOOLS", "web_search,get_current_utc_time").strip().lower()
     if raw == "none":
         return False, False, False
     parts = {p.strip() for p in raw.split(",") if p.strip()}
@@ -63,6 +62,8 @@ def _optional_tool_flags() -> tuple[bool, bool, bool]:
 ENABLE_WEB_SEARCH, ENABLE_READ_WEB_PAGE, ENABLE_UTC_TIME = _optional_tool_flags()
 
 SEARCH_MEMORY_CAP = int(os.environ.get("PARLOR_SEARCH_MEMORY_CHARS", "9000"))
+# Cap how much snapshot text is pasted into each user message (large blocks hurt tool use on E2B).
+SEARCH_MEMORY_INJECT_CAP = int(os.environ.get("PARLOR_SEARCH_MEMORY_INJECT_CHARS", "3200"))
 
 
 def _make_web_search_with_memory(memory: dict[str, str]):
@@ -82,19 +83,35 @@ def _make_web_search_with_memory(memory: dict[str, str]):
 
 
 def _user_text_search_memory_append(memory: dict[str, str]) -> str:
-    """Re-inject last search results into every user turn (model does not read server logs)."""
+    """Re-inject a compact slice of last lookup results (full blob is too heavy every turn on E2B)."""
     t = (memory.get("text") or "").strip()
     if not t:
         return ""
     q = (memory.get("query") or "").strip()
+    cap = max(800, SEARCH_MEMORY_INJECT_CAP)
+    truncated = False
+    if len(t) > cap:
+        t = t[:cap].rsplit("\n", 1)[0] + "\n"
+        truncated = True
+    tail = (
+        "\n[Snapshot truncated. Call web_search again if you need more links.]\n"
+        if truncated
+        else "\n"
+    )
+    read_page = (
+        "For full page text, call read_web_page with that https URL, then respond_to_user. "
+        if ENABLE_READ_WEB_PAGE
+        else ""
+    )
+    body = f"Query: {q}\n---\n{t}\n---"
     return (
-        "\n\n---\n[Latest lookup snapshot for this session — ground truth for follow-ups: "
-        "numbered results, first vs second link, hostnames, paths, snippets.]\n"
-        f"Query: {q}\n---\n{t}\n---\n"
-        "If the user wants details from one of those links, call read_web_page with that https URL, "
-        "then summarize in your own words (voice-first). "
-        "If something is still missing or they want fresher facts, run another lookup, then "
-        "respond_to_user. Never invent URLs.\n---"
+        "\n\n---\n[Lookup snapshot: same session, use for follow-ups. "
+        "Prefer numbered order and exact URLs.]\n"
+        + body
+        + tail
+        + read_page
+        + "If facts are stale or missing, web_search again, then respond_to_user. "
+        "Never invent URLs.\n---"
     )
 
 
@@ -103,6 +120,9 @@ def build_system_prompt() -> str:
         "You are a capable voice assistant (like an IDE copilot, but for spoken conversation). "
         "The user talks through a microphone and may show their camera. They also read a text "
         "transcript on screen while they listen.",
+        "",
+        "Gemma 4 E2B: each user turn sends audio and/or image before the text instruction. "
+        "Use that order: listen and look first, then read the text.",
         "",
         "Work like a good agent: use tools, read results internally, decide what matters, then "
         "choose how much to say aloud vs what to show as text. The user cannot see your raw tool "
@@ -155,24 +175,34 @@ def build_system_prompt() -> str:
             ",display_context:<|\"|> not ,display_context<|\"|>. "
             "(3) Avoid the ASCII double-quote character inside values; use apostrophes for emphasis. "
             "(4) Exactly one respond_to_user per turn—no code block: prefix, no duplicated call.",
+            "(5) NEVER output only a single word, digit, or nonsense fragment as assistant text. "
+            "That is invalid. Always end with respond_to_user carrying real response/display_context.",
             "",
         ]
     )
     if ENABLE_WEB_SEARCH:
+        snap_suffix = (
+            " For full page text, use read_web_page with the https URL, then respond_to_user."
+            if ENABLE_READ_WEB_PAGE
+            else ""
+        )
         lines.extend(
             [
-                "Session memory: The user message may include a [Latest lookup snapshot] block from "
-                "the most recent successful web_search. Prefer it for follow-ups (first link, exact "
-                "URLs, order). For 'what does that page say?' use read_web_page on the chosen https "
-                "URL, then respond_to_user.",
+                "Session memory: The user message may include a [Lookup snapshot] block from the last "
+                "web_search. Use it for follow-ups (exact URLs, order)."
+                + snap_suffix,
                 "",
-                "Follow-ups: Combine snapshot + chat. If you need newer or different pointers, "
-                "web_search again; if you need body text from one link, read_web_page, then "
-                "respond_to_user.",
+                "Follow-ups: Combine snapshot + what the user said. If pointers are not enough, "
+                "web_search again, then respond_to_user."
+                + (
+                    " If they need article body text, read_web_page, then respond_to_user."
+                    if ENABLE_READ_WEB_PAGE
+                    else ""
+                ),
                 "",
-                "Workflow: When you need pointers, web_search; when you need to read a specific page, "
-                "read_web_page; then always respond_to_user. Small talk: respond_to_user only. "
-                "Never output plain assistant text without respond_to_user.",
+                "Workflow: web_search when you need links/snippets; then always respond_to_user. "
+                "Small talk: respond_to_user only. Never emit plain assistant text without "
+                "respond_to_user. If you start typing bare text, stop and call respond_to_user instead.",
             ]
         )
     elif ENABLE_READ_WEB_PAGE:
@@ -284,6 +314,25 @@ def _sanitize_parlor_output(s: str | None) -> str:
     t = re.sub(r"<tool_call[^>]*>", "", t, flags=re.I)
     t = re.sub(r"</?tool_call\|?>", "", t, flags=re.I)
     return t.strip()
+
+
+def _looks_like_degenerate_assistant_text(s: str | None) -> bool:
+    """Bare tokens like '1' or 'Laptop' are not valid voice replies when tools are enabled."""
+    if s is None:
+        return True
+    t = str(s).strip()
+    if not t:
+        return True
+    if t.lower().startswith(("http://", "https://")) and len(t) > 80:
+        return False
+    if len(t) < 4:
+        return True
+    if re.fullmatch(r"\d+", t):
+        return True
+    words = t.split()
+    if len(words) == 1 and len(t) < 56:
+        return True
+    return False
 
 
 def _scrub_tracking_urls(s: str) -> str:
@@ -464,16 +513,14 @@ async def websocket_endpoint(ws: WebSocket):
                 search_hint = ""
                 if ENABLE_WEB_SEARCH:
                     search_hint = (
-                        " If this message includes [Latest lookup snapshot], use it for follow-ups "
-                        "(first link, exact URLs). For what a specific page says, call read_web_page "
-                        "with that https URL when available, then respond_to_user. "
-                        "If you need new pointers, call web_search first. "
-                        "Put URLs and bullets in display_context; keep voice concise and natural."
+                        " Answer the user; use [Lookup snapshot] when it helps. "
+                        "Finish with respond_to_user only (no bare assistant text)."
                     )
+                    if ENABLE_READ_WEB_PAGE:
+                        search_hint += " Use read_web_page only when they need full page text."
                 elif ENABLE_READ_WEB_PAGE:
                     search_hint = (
-                        " For page details, call read_web_page with a full https URL the user gave you, "
-                        "then respond_to_user."
+                        " For page details, call read_web_page with a full https URL, then respond_to_user."
                     )
                 tail = memory_append + search_hint
 
@@ -600,6 +647,12 @@ async def websocket_endpoint(ws: WebSocket):
                             text_response = _scrub_tracking_urls(_sanitize_parlor_output(raw_text))
                             if not text_response.strip():
                                 # Empty or token-only decode (e.g. <|"|>)—keep conversation history.
+                                text_response = _EMPTY_ASSISTANT_RETRY_MESSAGE
+                            elif _looks_like_degenerate_assistant_text(text_response):
+                                print(
+                                    "Parlor: degenerate assistant text without tools; resetting conversation"
+                                )
+                                needs_conversation_reset = True
                                 text_response = _EMPTY_ASSISTANT_RETRY_MESSAGE
                         print(f"LLM ({llm_time:.2f}s) [no tool] raw head: {raw_text[:160]!r}…")
 

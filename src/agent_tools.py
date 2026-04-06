@@ -384,7 +384,7 @@ def web_search(
         try:
             html_hits = _duckduckgo_html(qn)
             if html_hits:
-                parts.append("[Pages found — titles and links]\n" + html_hits)
+                parts.append("[Pages found: titles and links]\n" + html_hits)
         except (urllib.error.URLError, TimeoutError, OSError) as e:
             parts.append(f"[Page list lookup failed: {e}]")
 
