@@ -10,6 +10,7 @@ import re
 import tempfile
 import time
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import uvicorn
@@ -406,6 +407,45 @@ def _looks_like_degenerate_assistant_text(s: str | None) -> bool:
     return False
 
 
+_CONTENT_TOOLS = frozenset({"web_search", "read_web_page"})
+
+
+def _content_tools_ran_without_respond(tool_trace: list[str]) -> bool:
+    return bool(tool_trace) and any(t in _CONTENT_TOOLS for t in tool_trace)
+
+
+def _should_nudge_respond_after_content_tools(
+    tool_result: dict[str, Any],
+    tool_trace: list[str],
+    response: dict[str, Any] | None,
+    litert_error: str | None,
+) -> bool:
+    if litert_error or tool_result or not response:
+        return False
+    if not _content_tools_ran_without_respond(tool_trace):
+        return False
+    raw_text = response.get("content", [{}])[0].get("text", "")
+    text_s = _scrub_tracking_urls(_sanitize_parlor_output(raw_text))
+    if not text_s.strip():
+        return True
+    if _looks_like_degenerate_assistant_text(text_s) and not _raw_text_suggests_gemma_thinking(raw_text):
+        return True
+    return False
+
+
+_RESPOND_NUDGE_USER_TEXT = (
+    "System follow-up (no new user audio): web_search or read_web_page already returned content "
+    "in this thread. Do NOT call web_search or read_web_page again. Call respond_to_user exactly "
+    "once with response= a clear spoken answer using the fetched page text (e.g. ingredients and "
+    "numbered steps for a recipe). Use display_context only if helpful; transcription may be empty."
+)
+
+_CONTENT_TOOL_PARTIAL_MESSAGE = (
+    "I found the page and have the recipe details, but I could not speak them clearly this round. "
+    "Say summarize the recipe in a few sentences and I will try again."
+)
+
+
 def _scrub_tracking_urls(s: str) -> str:
     """Remove ad/tracking URLs the model may have echoed (never speak or show these)."""
 
@@ -626,117 +666,176 @@ async def websocket_endpoint(ws: WebSocket):
                         }
                     )
 
-                # LLM inference
-                t0 = time.time()
+                # LLM inference (optional second pass: nudge respond_to_user after content tools)
+                llm_time = 0.0
                 tool_result.clear()
                 tool_trace.clear()
-                response = None
+                response: dict[str, Any] | None = None
                 litert_error: str | None = None
-                try:
-                    response = await asyncio.get_event_loop().run_in_executor(
-                        None, lambda: conversation.send_message({"role": "user", "content": content})
-                    )
-                except RuntimeError as ex:
-                    litert_error = str(ex)
-                    print(f"Parlor: LiteRT send_message RuntimeError: {litert_error[:800]}")
-                llm_time = time.time() - t0
-
-                # Extract response from tool call or fallback to raw text
                 skip_audio = False
                 display_ctx = ""
                 transcription = None
                 needs_conversation_reset = False
                 recovered_from_litert_parse = False
+                text_response = _EMPTY_ASSISTANT_RETRY_MESSAGE
 
-                if litert_error is not None:
-                    recovered = _recover_tool_result_from_litert_error(litert_error)
-                    if recovered:
-                        tool_result.update(recovered)
-                        tool_trace.append("respond_to_user(recovered)")
-                        recovered_from_litert_parse = True
-                        print(
-                            f"LLM ({llm_time:.2f}s) [recovered] respond_to_user from LiteRT error text"
-                        )
-                        litert_error = None
-
-                if litert_error is not None:
-                    needs_conversation_reset = True
-                    text_response = _LITERT_TOOL_PARSE_MESSAGE
-                    print(f"LLM ({llm_time:.2f}s) [error] tool parse / runtime failure")
-                elif tool_result:
-                    transcription = _strip_model_text(tool_result.get("transcription", ""))
-                    if _looks_like_leaked_tool_output(transcription):
-                        transcription = ""
-
-                    spoken_raw = _strip_model_text(tool_result.get("response", ""))
-                    display_ctx = _strip_model_text(tool_result.get("display_context", ""))
-                    if _looks_like_leaked_tool_output(spoken_raw):
-                        spoken_raw = ""
-                    if _looks_like_leaked_tool_output(display_ctx):
-                        display_ctx = ""
-
-                    text_response = _scrub_tracking_urls(_sanitize_parlor_output(spoken_raw))
-                    display_ctx = _scrub_tracking_urls(_sanitize_parlor_output(display_ctx))
-
-                    if not text_response and not display_ctx:
-                        had_tool_leak = (
-                            _looks_like_leaked_tool_output(tool_result.get("response"))
-                            or _looks_like_leaked_tool_output(tool_result.get("display_context"))
-                            or _looks_like_leaked_tool_output(tool_result.get("transcription"))
-                        )
-                        if had_tool_leak:
-                            needs_conversation_reset = True
-                            text_response = _CONVERSATION_RESET_MESSAGE
-                        else:
-                            text_response = _EMPTY_ASSISTANT_RETRY_MESSAGE
-                        skip_audio = False
-                    else:
-                        skip_audio = not text_response and bool(display_ctx)
-
-                    print(
-                        f"LLM ({llm_time:.2f}s) [tool] heard: {transcription!r} → "
-                        f"spoken={text_response[:120]!r} display_len={len(display_ctx)} "
-                        f"skip_audio={skip_audio}"
-                    )
-                else:
-                    if not response:
-                        text_response = _EMPTY_ASSISTANT_RETRY_MESSAGE
-                        print(f"LLM ({llm_time:.2f}s) [no response object]")
-                    else:
-                        raw_text = response["content"][0]["text"]
-                        if _looks_like_leaked_tool_output(raw_text):
-                            print(
-                                "Parlor: leaked tool syntax in assistant text; resetting conversation"
+                for attempt in (0, 1):
+                    if attempt == 0:
+                        t0 = time.time()
+                        try:
+                            response = await asyncio.get_event_loop().run_in_executor(
+                                None,
+                                lambda: conversation.send_message({"role": "user", "content": content}),
                             )
-                            needs_conversation_reset = True
-                            text_response = _CONVERSATION_RESET_MESSAGE
-                        else:
-                            text_response = _scrub_tracking_urls(_sanitize_parlor_output(raw_text))
-                            thinkingish = _raw_text_suggests_gemma_thinking(raw_text)
-                            if not text_response.strip():
+                        except RuntimeError as ex:
+                            litert_error = str(ex)
+                            print(f"Parlor: LiteRT send_message RuntimeError: {litert_error[:800]}")
+                        llm_time += time.time() - t0
+                    else:
+                        if not _should_nudge_respond_after_content_tools(
+                            tool_result, tool_trace, response, litert_error
+                        ):
+                            break
+                        print(
+                            "Parlor: nudging respond_to_user after content tools without respond_to_user"
+                        )
+                        t1 = time.time()
+                        try:
+                            response = await asyncio.get_event_loop().run_in_executor(
+                                None,
+                                lambda: conversation.send_message(
+                                    {
+                                        "role": "user",
+                                        "content": [{"type": "text", "text": _RESPOND_NUDGE_USER_TEXT}],
+                                    }
+                                ),
+                            )
+                            litert_error = None
+                        except RuntimeError as ex:
+                            litert_error = str(ex)
+                            print(f"Parlor: LiteRT nudge send_message RuntimeError: {litert_error[:800]}")
+                        llm_time += time.time() - t1
+
+                    skip_audio = False
+                    display_ctx = ""
+                    transcription = None
+                    needs_conversation_reset = False
+                    recovered_from_litert_parse = False
+
+                    if litert_error is not None:
+                        recovered = _recover_tool_result_from_litert_error(litert_error)
+                        if recovered:
+                            tool_result.update(recovered)
+                            tool_trace.append("respond_to_user(recovered)")
+                            recovered_from_litert_parse = True
+                            print(
+                                f"LLM ({llm_time:.2f}s) [recovered] respond_to_user from LiteRT error text"
+                            )
+                            litert_error = None
+
+                    if litert_error is not None:
+                        needs_conversation_reset = True
+                        text_response = _LITERT_TOOL_PARSE_MESSAGE
+                        print(f"LLM ({llm_time:.2f}s) [error] tool parse / runtime failure")
+                    elif tool_result:
+                        transcription = _strip_model_text(tool_result.get("transcription", ""))
+                        if _looks_like_leaked_tool_output(transcription):
+                            transcription = ""
+
+                        spoken_raw = _strip_model_text(tool_result.get("response", ""))
+                        display_ctx = _strip_model_text(tool_result.get("display_context", ""))
+                        if _looks_like_leaked_tool_output(spoken_raw):
+                            spoken_raw = ""
+                        if _looks_like_leaked_tool_output(display_ctx):
+                            display_ctx = ""
+
+                        text_response = _scrub_tracking_urls(_sanitize_parlor_output(spoken_raw))
+                        display_ctx = _scrub_tracking_urls(_sanitize_parlor_output(display_ctx))
+
+                        if not text_response and not display_ctx:
+                            had_tool_leak = (
+                                _looks_like_leaked_tool_output(tool_result.get("response"))
+                                or _looks_like_leaked_tool_output(tool_result.get("display_context"))
+                                or _looks_like_leaked_tool_output(tool_result.get("transcription"))
+                            )
+                            if had_tool_leak:
+                                needs_conversation_reset = True
+                                text_response = _CONVERSATION_RESET_MESSAGE
+                            else:
                                 text_response = _EMPTY_ASSISTANT_RETRY_MESSAGE
-                                if thinkingish:
-                                    print(
-                                        "Parlor: empty after sanitize; thinking channel only—no reset"
+                            skip_audio = False
+                        else:
+                            skip_audio = not text_response and bool(display_ctx)
+
+                        print(
+                            f"LLM ({llm_time:.2f}s) [tool] heard: {transcription!r} → "
+                            f"spoken={text_response[:120]!r} display_len={len(display_ctx)} "
+                            f"skip_audio={skip_audio}"
+                        )
+                    else:
+                        raw_text = ""
+                        if not response:
+                            text_response = _EMPTY_ASSISTANT_RETRY_MESSAGE
+                            print(f"LLM ({llm_time:.2f}s) [no response object]")
+                        else:
+                            raw_text = response["content"][0]["text"]
+                            if _looks_like_leaked_tool_output(raw_text):
+                                print(
+                                    "Parlor: leaked tool syntax in assistant text; resetting conversation"
+                                )
+                                needs_conversation_reset = True
+                                text_response = _CONVERSATION_RESET_MESSAGE
+                            else:
+                                text_response = _scrub_tracking_urls(_sanitize_parlor_output(raw_text))
+                                thinkingish = _raw_text_suggests_gemma_thinking(raw_text)
+                                content_tools_fallback = attempt == 1 and _content_tools_ran_without_respond(
+                                    tool_trace
+                                )
+                                if not text_response.strip():
+                                    text_response = (
+                                        _CONTENT_TOOL_PARTIAL_MESSAGE
+                                        if content_tools_fallback
+                                        else _EMPTY_ASSISTANT_RETRY_MESSAGE
                                     )
-                                else:
-                                    needs_conversation_reset = True
-                                    print(
-                                        "Parlor: empty assistant text without tools; resetting conversation"
-                                    )
-                            elif _looks_like_degenerate_assistant_text(text_response):
-                                if thinkingish:
-                                    text_response = _EMPTY_ASSISTANT_RETRY_MESSAGE
-                                    print(
-                                        "Parlor: degenerate after strip but thinking present—no reset"
-                                    )
-                                else:
-                                    print(
-                                        "Parlor: degenerate assistant text without tools; resetting conversation"
-                                    )
-                                    needs_conversation_reset = True
-                                    text_response = _EMPTY_ASSISTANT_RETRY_MESSAGE
-                        print(f"LLM ({llm_time:.2f}s) [no tool] raw head: {raw_text[:160]!r}…")
+                                    if thinkingish:
+                                        print(
+                                            "Parlor: empty after sanitize; thinking channel only—no reset"
+                                        )
+                                    else:
+                                        needs_conversation_reset = not content_tools_fallback
+                                        print(
+                                            "Parlor: empty assistant text without tools; resetting conversation"
+                                            if not content_tools_fallback
+                                            else "Parlor: empty after content tools nudge; partial fallback"
+                                        )
+                                elif _looks_like_degenerate_assistant_text(text_response):
+                                    if thinkingish:
+                                        text_response = _EMPTY_ASSISTANT_RETRY_MESSAGE
+                                        print(
+                                            "Parlor: degenerate after strip but thinking present—no reset"
+                                        )
+                                    else:
+                                        print(
+                                            "Parlor: degenerate assistant text without tools; resetting conversation"
+                                            if not content_tools_fallback
+                                            else "Parlor: degenerate after content tools nudge; partial fallback"
+                                        )
+                                        needs_conversation_reset = not content_tools_fallback
+                                        text_response = (
+                                            _CONTENT_TOOL_PARTIAL_MESSAGE
+                                            if content_tools_fallback
+                                            else _EMPTY_ASSISTANT_RETRY_MESSAGE
+                                        )
+                            print(f"LLM ({llm_time:.2f}s) [no tool] raw head: {raw_text[:160]!r}…")
+
+                    if attempt == 0 and _should_nudge_respond_after_content_tools(
+                        tool_result, tool_trace, response, litert_error
+                    ):
+                        needs_conversation_reset = False
+                        recovered_from_litert_parse = False
+                        continue
+
+                    break
 
                 if needs_conversation_reset or recovered_from_litert_parse:
                     reopen_conversation()
