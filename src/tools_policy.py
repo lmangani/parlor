@@ -10,7 +10,7 @@ import litert_lm
 
 from agent_tools import MAX_QUERY_LEN, extract_search_query
 
-MAX_TOOL_RESPONSE_CHARS = 8000
+MAX_TOOL_RESPONSE_CHARS = 14000
 
 
 def extract_tool_name(tool_call: dict[str, Any]) -> str | None:
@@ -93,6 +93,19 @@ class ParlorToolPolicy(litert_lm.ToolEventHandler):
                 print("web_search denied: query too long")
                 return False
 
+        if name == "respond_to_user":
+            tr = args.get("transcription", "")
+            if not isinstance(tr, str) or not tr.strip():
+                print("respond_to_user denied: missing transcription")
+                return False
+            r = args.get("response", "")
+            d = args.get("display_context", "")
+            has_voice = isinstance(r, str) and bool(r.strip())
+            has_screen = isinstance(d, str) and bool(d.strip())
+            if not has_voice and not has_screen:
+                print("respond_to_user denied: need non-empty response and/or display_context")
+                return False
+
         self._trace.append(name)
         return True
 
@@ -104,13 +117,15 @@ def build_optional_tools(
     *,
     enable_web_search: bool,
     enable_utc_time: bool,
+    web_search_impl: Any | None = None,
 ) -> list[Any]:
     """Tool order: web_search before time so the schema highlights search for factual turns."""
     from agent_tools import get_current_utc_time, web_search
 
+    ws = web_search_impl if web_search_impl is not None else web_search
     tools: list[Any] = []
     if enable_web_search:
-        tools.append(web_search)
+        tools.append(ws)
     if enable_utc_time:
         tools.append(get_current_utc_time)
     return tools

@@ -81,7 +81,58 @@ def _strip_tags(fragment: str) -> str:
     return html_lib.unescape(re.sub(r"\s+", " ", t).strip())
 
 
-def _duckduckgo_html(query: str) -> str:
+def _normalize_result_url(href: str) -> str:
+    h = (href or "").strip()
+    if h.startswith("//"):
+        h = "https:" + h
+    try:
+        parsed = urllib.parse.urlparse(h)
+    except ValueError:
+        return h
+    if "duckduckgo.com" in (parsed.netloc or "") and parsed.query and "uddg=" in parsed.query:
+        qs = urllib.parse.parse_qs(parsed.query)
+        inner = (qs.get("uddg") or [None])[0]
+        if inner:
+            return urllib.parse.unquote(inner)
+    return h
+
+
+def _add_source(
+    sources: list[dict[str, str]],
+    seen_urls: set[str],
+    title: str,
+    url: str,
+) -> None:
+    u = _normalize_result_url(url).strip()
+    t = (title or "").strip()
+    if not u or u in seen_urls:
+        return
+    if not t:
+        t = u[:80]
+    seen_urls.add(u)
+    sources.append({"title": t[:240], "url": u[:2048]})
+
+
+def _sources_from_ddg_json(j: dict[str, Any], sources: list[dict[str, str]], seen_urls: set[str]) -> None:
+    if j.get("AbstractURL") and j.get("AbstractText"):
+        _add_source(sources, seen_urls, str(j.get("Heading", "Summary")), str(j["AbstractURL"]))
+    for t in j.get("RelatedTopics", [])[:12]:
+        if not isinstance(t, dict):
+            continue
+        url = t.get("FirstURL")
+        text = t.get("Text")
+        if url and text:
+            _add_source(sources, seen_urls, str(text).strip(), str(url))
+        for sub in t.get("Topics", []) or []:
+            if isinstance(sub, dict) and sub.get("FirstURL") and sub.get("Text"):
+                _add_source(sources, seen_urls, str(sub["Text"]).strip(), str(sub["FirstURL"]))
+
+
+def _duckduckgo_html_with_sources(
+    query: str,
+    sources: list[dict[str, str]],
+    seen_urls: set[str],
+) -> str:
     """HTML results when the instant-answer API has little text (broader coverage)."""
     body = urllib.parse.urlencode({"q": query}).encode()
     url = "https://html.duckduckgo.com/html/"
@@ -95,34 +146,60 @@ def _duckduckgo_html(query: str) -> str:
         },
     )
     with urllib.request.urlopen(req, timeout=DEFAULT_TIMEOUT_S) as resp:
-        html = resp.read(MAX_WEB_BODY_BYTES).decode("utf-8", errors="replace")
+        html_page = resp.read(MAX_WEB_BODY_BYTES).decode("utf-8", errors="replace")
     lines: list[str] = []
-    seen: set[str] = set()
-    for pat in (
-        r'class="result__a"[^>]*>([^<]+)</a>',
-        r'class="result__title"[^>]*>\s*<a[^>]*>([^<]+)</a>',
-        r'rel="nofollow"[^>]*class="[^"]*result-link[^"]*"[^>]*>([^<]+)</a>',
-    ):
-        for m in re.finditer(pat, html, re.I):
-            title = _strip_tags(m.group(1))
-            if len(title) < 3 or title in seen:
-                continue
-            seen.add(title)
-            lines.append(f"• {title}")
-            if len(lines) >= 10:
-                break
-        if len(lines) >= 6:
+    seen_titles: set[str] = set()
+
+    pat_a = r'<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>([^<]*)</a>'
+    for m in re.finditer(pat_a, html_page, re.I):
+        href, raw_title = m.group(1), m.group(2)
+        title = _strip_tags(raw_title)
+        if len(title) < 3 or title in seen_titles:
+            continue
+        norm = _normalize_result_url(href)
+        _add_source(sources, seen_urls, title, href)
+        seen_titles.add(title)
+        lines.append(f"{len(lines) + 1}. {title}\n   URL: {norm}")
+        if len(lines) >= 10:
             break
-    for m in re.finditer(r'class="result__snippet"[^>]*>([^<]+(?:<[^/][^<]*</[^>]+>[^<]+)*)', html):
+
+    if len(lines) < 4:
+        for pat in (
+            r'class="result__title"[^>]*>\s*<a[^>]+href="([^"]+)"[^>]*>([^<]+)</a>',
+            r'rel="nofollow"[^>]*class="[^"]*result-link[^"]*"[^>]*href="([^"]+)"[^>]*>([^<]+)</a>',
+        ):
+            for m in re.finditer(pat, html_page, re.I):
+                href, raw_title = m.group(1), m.group(2)
+                title = _strip_tags(raw_title)
+                if len(title) < 3 or title in seen_titles:
+                    continue
+                norm = _normalize_result_url(href)
+                _add_source(sources, seen_urls, title, href)
+                seen_titles.add(title)
+                lines.append(f"{len(lines) + 1}. {title}\n   URL: {norm}")
+                if len(lines) >= 10:
+                    break
+            if len(lines) >= 4:
+                break
+
+    for m in re.finditer(
+        r'class="result__snippet"[^>]*>([^<]+(?:<[^/][^<]*</[^>]+>[^<]+)*)',
+        html_page,
+    ):
         snip = _strip_tags(m.group(1))
         if len(snip) > 40:
             key = snip[:80]
-            if key not in seen:
-                seen.add(key)
+            if key not in seen_titles:
+                seen_titles.add(key)
                 lines.append(snip)
-        if len(lines) >= 12:
+        if len(lines) >= 14:
             break
     return "\n".join(lines)
+
+
+def _duckduckgo_html(query: str) -> str:
+    """HTML-only result text (no source accumulation)."""
+    return _duckduckgo_html_with_sources(query, [], set())
 
 
 def _wikipedia_snippets(query: str) -> str:

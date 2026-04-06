@@ -50,10 +50,13 @@ ENABLE_WEB_SEARCH, ENABLE_UTC_TIME = _optional_tool_flags()
 
 def build_system_prompt() -> str:
     lines = [
-        "You are a friendly, conversational AI assistant. The user is talking to you "
-        "through a microphone and showing you their camera.",
+        "You are a capable voice assistant (like an IDE copilot, but for spoken conversation). "
+        "The user talks through a microphone and may show their camera. They also read a text "
+        "transcript on screen while they listen.",
         "",
-        "You use tools in two stages: (1) gather facts if needed, (2) deliver your reply.",
+        "Work like a good agent: use tools, read results internally, decide what matters, then "
+        "choose how much to say aloud vs what to show as text. The user cannot see your raw tool "
+        "logs—only what you put in respond_to_user.",
         "",
         "Tools:",
     ]
@@ -74,8 +77,16 @@ def build_system_prompt() -> str:
         )
     lines.extend(
         [
-            "- respond_to_user: REQUIRED last step on every turn. Pass transcription (exact words "
-            "the user said in the audio) and response (your 1–4 short sentences for voice).",
+            "- respond_to_user: REQUIRED last step every turn. Fields:",
+            "  • transcription: exact words the user said in the audio.",
+            "  • response: what you want spoken (TTS)—short, natural, 1–4 sentences for the ear. "
+            "Leave empty when you prefer text-only for this turn: if display_context is non-empty, "
+            "no audio is played and the user reads the transcript.",
+            "  • display_context: optional longer text shown in the transcript in parallel with TTS. "
+            "Put search summaries, bullet lists, URLs, numbered sources, step-by-step notes, or "
+            "anything too dense for voice. The user reads this while or after hearing response.",
+            "  Use display_context whenever tools returned detail worth keeping (especially web_search). "
+            "You may speak a brief overview in response and put the full breakdown in display_context.",
             "",
         ]
     )
@@ -153,6 +164,10 @@ def split_sentences(text: str) -> list[str]:
     return [s.strip() for s in parts if s.strip()]
 
 
+def _strip_model_text(s: str | None) -> str:
+    return str(s or "").replace('<|"|>', "").strip()
+
+
 @app.get("/")
 async def root():
     return HTMLResponse(content=(Path(__file__).parent / "index.html").read_text())
@@ -166,15 +181,23 @@ async def websocket_endpoint(ws: WebSocket):
     tool_result = {}
     tool_trace: list[str] = []
 
-    def respond_to_user(transcription: str, response: str) -> str:
-        """Respond to the user's voice message.
+    def respond_to_user(
+        transcription: str,
+        response: str = "",
+        display_context: str = "",
+    ) -> str:
+        """Deliver the turn: what to speak (TTS) and/or what to show on screen.
 
         Args:
             transcription: Exact transcription of what the user said in the audio.
-            response: Your conversational response to the user. Keep it to 1-4 short sentences.
+            response: Spoken reply (1–4 short sentences for TTS). May be empty if you only
+                want on-screen text; a short bridge line may be spoken instead.
+            display_context: Longer text for the transcript: tool summaries, URLs, bullets,
+                structured notes—shown in parallel with audio so the user can read details.
         """
         tool_result["transcription"] = transcription
         tool_result["response"] = response
+        tool_result["display_context"] = display_context
         return "OK"
 
     optional = build_optional_tools(
@@ -238,7 +261,8 @@ async def websocket_endpoint(ws: WebSocket):
                     search_hint = (
                         " If their question needs real-world facts (news, people, places, scores, "
                         "weather, dates, or anything to verify online), call web_search with a "
-                        "short query before you call respond_to_user."
+                        "short query before you call respond_to_user. Summarize what you learned in "
+                        "display_context (links, bullets) and keep response short for voice."
                     )
 
                 if audio_path and image_path:
@@ -282,11 +306,19 @@ async def websocket_endpoint(ws: WebSocket):
                 llm_time = time.time() - t0
 
                 # Extract response from tool call or fallback to raw text
+                skip_audio = False
                 if tool_result:
-                    strip = lambda s: s.replace('<|"|>', "").strip()
-                    transcription = strip(tool_result.get("transcription", ""))
-                    text_response = strip(tool_result.get("response", ""))
-                    print(f"LLM ({llm_time:.2f}s) [tool] heard: {transcription!r} → {text_response}")
+                    transcription = _strip_model_text(tool_result.get("transcription", ""))
+                    spoken_raw = _strip_model_text(tool_result.get("response", ""))
+                    display_ctx = _strip_model_text(tool_result.get("display_context", ""))
+                    # Voice-only empty + on-screen detail => no TTS (read the transcript).
+                    skip_audio = not spoken_raw and bool(display_ctx)
+                    text_response = spoken_raw
+                    print(
+                        f"LLM ({llm_time:.2f}s) [tool] heard: {transcription!r} → "
+                        f"spoken={text_response[:120]!r} display_len={len(display_ctx)} "
+                        f"skip_audio={skip_audio}"
+                    )
                 else:
                     transcription = None
                     text_response = response["content"][0]["text"]
@@ -299,12 +331,20 @@ async def websocket_endpoint(ws: WebSocket):
                 reply = {"type": "text", "text": text_response, "llm_time": round(llm_time, 2)}
                 if transcription:
                     reply["transcription"] = transcription
+                dc = _strip_model_text(tool_result.get("display_context", ""))
+                if dc:
+                    reply["display_context"] = dc
+                if skip_audio:
+                    reply["skip_audio"] = True
                 if tool_trace:
                     reply["tools_used"] = list(tool_trace)
                 await ws.send_text(json.dumps(reply))
 
                 if interrupted.is_set():
                     print("Interrupted before TTS, skipping audio")
+                    continue
+
+                if skip_audio:
                     continue
 
                 # Streaming TTS: split into sentences and send chunks progressively

@@ -334,6 +334,48 @@
     letter-spacing: 0.02em;
   }
 
+  .msg.assistant .msg-voice {
+    font-size: 13.5px;
+    line-height: 1.55;
+    color: var(--c-text);
+  }
+
+  .msg-screen {
+    margin-top: 10px;
+    padding: 10px 12px;
+    border-radius: 10px;
+    background: rgba(0, 0, 0, 0.22);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    font-size: 12.5px;
+    line-height: 1.5;
+  }
+
+  .msg-screen-label {
+    font-size: 9px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--c-text-dim);
+    margin-bottom: 6px;
+  }
+
+  .msg-screen-body {
+    white-space: pre-wrap;
+    word-break: break-word;
+    color: var(--c-text-bright);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .msg-screen-body a.msg-link {
+    color: #93c5fd;
+    text-decoration: underline;
+    text-underline-offset: 2px;
+  }
+
+  .msg-screen-body a.msg-link:hover {
+    color: #bfdbfe;
+  }
+
   .loading-dots {
     display: inline-flex;
     gap: 4px;
@@ -655,7 +697,16 @@ function connect() {
         ? msg.tools_used.filter((t) => t !== 'respond_to_user')
         : [];
       const toolsSuffix = used.length ? ` · ${used.join(', ')}` : '';
-      addMessage('assistant', msg.text, `LLM ${msg.llm_time}s${toolsSuffix}`);
+      addMessage(
+        'assistant',
+        msg.text,
+        `LLM ${msg.llm_time}s${toolsSuffix}`,
+        msg.display_context,
+      );
+      if (msg.skip_audio) {
+        setState('listening');
+        setStatus('connected', 'Connected');
+      }
     } else if (msg.type === 'audio_start') {
       if (ignoreIncomingAudio) return;
       streamSampleRate = msg.sample_rate || 24000;
@@ -834,10 +885,38 @@ function queueAudioChunk(base64Pcm) {
 }
 
 // ── UI ──
-function addMessage(role, text, meta) {
+function escapeHtml(s) {
+  if (s == null || s === '') return '';
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+function linkifyUrls(raw) {
+  const parts = String(raw).split(/(https?:\/\/[^\s<>'"]+)/g);
+  return parts.map((part) => {
+    if (/^https?:\/\//.test(part)) {
+      const safe = part.replace(/"/g, '&quot;');
+      return `<a class="msg-link" href="${safe}" target="_blank" rel="noopener noreferrer">${escapeHtml(part)}</a>`;
+    }
+    return escapeHtml(part);
+  }).join('');
+}
+
+function addMessage(role, text, meta, displayContext) {
   const div = document.createElement('div');
   div.className = `msg ${role}`;
-  div.innerHTML = `${text}${meta ? `<div class="meta">${meta}</div>` : ''}`;
+  if (role === 'assistant') {
+    let body = '';
+    if (text) body += `<div class="msg-voice">${escapeHtml(text)}</div>`;
+    if (displayContext) {
+      body += `<div class="msg-screen"><div class="msg-screen-label">On screen</div><div class="msg-screen-body">${linkifyUrls(displayContext)}</div></div>`;
+    }
+    if (!body) body = `<div class="msg-voice">${escapeHtml(text || '…')}</div>`;
+    div.innerHTML = body + (meta ? `<div class="meta">${meta}</div>` : '');
+  } else {
+    div.innerHTML = `${text}${meta ? `<div class="meta">${meta}</div>` : ''}`;
+  }
   messagesDiv.appendChild(div);
   messagesDiv.scrollTop = messagesDiv.scrollHeight;
 }
