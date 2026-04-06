@@ -63,7 +63,7 @@ ENABLE_WEB_SEARCH, ENABLE_READ_WEB_PAGE, ENABLE_UTC_TIME = _optional_tool_flags(
 
 SEARCH_MEMORY_CAP = int(os.environ.get("PARLOR_SEARCH_MEMORY_CHARS", "9000"))
 # Cap how much snapshot text is pasted into each user message (large blocks hurt tool use on E2B).
-SEARCH_MEMORY_INJECT_CAP = int(os.environ.get("PARLOR_SEARCH_MEMORY_INJECT_CHARS", "3200"))
+SEARCH_MEMORY_INJECT_CAP = int(os.environ.get("PARLOR_SEARCH_MEMORY_INJECT_CHARS", "4800"))
 
 
 def _make_web_search_with_memory(memory: dict[str, str]):
@@ -82,6 +82,32 @@ def _make_web_search_with_memory(memory: dict[str, str]):
     return web_search_with_memory
 
 
+def _clip_search_memory_for_inject(t: str, cap: int) -> tuple[str, bool]:
+    """Prefer keeping auto-fetched page text; do not drop the recipe body to save link lines."""
+    if len(t) <= cap:
+        return t, False
+    anchor = agent_tools.SEARCH_MEMORY_FETCH_ANCHOR
+    idx = t.find(anchor)
+    if idx >= 0:
+        start = t.rfind("\n---\n", 0, idx)
+        if start < 0:
+            listings, fetched = t[:idx].strip(), t[idx:].strip()
+        else:
+            listings, fetched = t[:start].strip(), t[start + 1 :].strip()
+        if len(listings) + len(fetched) + 30 <= cap:
+            return listings + "\n\n" + fetched, False
+        fcap = min(len(fetched), max(2500, cap // 2))
+        if len(fetched) > fcap:
+            fetched = fetched[:fcap].rsplit("\n", 1)[0] + "\n…[page text truncated…]\n"
+        room = cap - len(fetched) - 40
+        if room >= 400:
+            listings = listings[:room].rsplit("\n", 1)[0] + "\n[…links shortened…]\n"
+        else:
+            listings = "[…]\n"
+        return (listings + "\n\n" + fetched).strip(), True
+    return t[:cap].rsplit("\n", 1)[0] + "\n", True
+
+
 def _user_text_search_memory_append(memory: dict[str, str]) -> str:
     """Re-inject a compact slice of last lookup results (full blob is too heavy every turn on E2B)."""
     t = (memory.get("text") or "").strip()
@@ -89,10 +115,7 @@ def _user_text_search_memory_append(memory: dict[str, str]) -> str:
         return ""
     q = (memory.get("query") or "").strip()
     cap = max(800, SEARCH_MEMORY_INJECT_CAP)
-    truncated = False
-    if len(t) > cap:
-        t = t[:cap].rsplit("\n", 1)[0] + "\n"
-        truncated = True
+    t, truncated = _clip_search_memory_for_inject(t, cap)
     tail = (
         "\n[Snapshot truncated. Call web_search again if you need more links.]\n"
         if truncated
@@ -110,8 +133,8 @@ def _user_text_search_memory_append(memory: dict[str, str]) -> str:
         + body
         + tail
         + read_page
-        + "If facts are stale or missing, web_search again, then respond_to_user. "
-        "Never invent URLs.\n---"
+        + "If a [Fetched page text] section appears, use it to answer in full (e.g. recipe), not with links. "
+        "If facts are stale or missing, web_search again, then respond_to_user. Never invent URLs.\n---"
     )
 
 
@@ -136,10 +159,10 @@ def build_system_prompt() -> str:
     if ENABLE_WEB_SEARCH:
         lines.extend(
             [
-                "- web_search: Find fresh pointers and short snippets on the open web when the user "
-                "asks about news, weather, events, places, products, or anything you should verify. "
-                "Use short keyword queries; you may call more than once. Results are for you to read "
-                "and paraphrase—never read tool labels aloud.",
+                "- web_search: Looks up the open web and usually **pulls in plain text from the top "
+                "matching page** (recipes, articles, guides). Your job is to **say that content** in "
+                "natural speech—full steps, ingredients, or facts. Do **not** answer by only naming "
+                "sites or reading URLs; the user wants substance, not link spam.",
                 "",
             ]
         )
@@ -163,8 +186,10 @@ def build_system_prompt() -> str:
             "plain text in value—NOT JSON). LiteRT wraps each field in <|\"|>…<|\"|>; JSON inside a "
             "field breaks the parser because quote characters clash with the wrapper.",
             "  Fields (each optional except you must fill response and/or display_context):",
-            "  • response — short text for TTS (1–4 sentences).",
-            "  • display_context — bullets, URLs, search listings for the on-screen transcript.",
+            "  • response — what the user hears. For recipes/how-tos this must carry the real answer "
+            "(ingredients, steps), not 'here is a link'. Aim for enough spoken detail to be useful.",
+            "  • display_context — optional extra (short notes). Do not dump URL lists here as a "
+            "substitute for speaking the answer; omit or keep minimal unless the user asked for links.",
             "  • transcription — what the user said, if known; else leave empty.",
             "  SYNTAX (copy the shape exactly): after each field name there must be a colon, then "
             "<|\"|>, then your text, then <|\"|>, then a comma before the next field name:",
@@ -200,7 +225,7 @@ def build_system_prompt() -> str:
                     else ""
                 ),
                 "",
-                "Workflow: web_search when you need links/snippets; then always respond_to_user. "
+                "Workflow: web_search when you need facts or instructions; then always respond_to_user. "
                 "Small talk: respond_to_user only. Never emit plain assistant text without "
                 "respond_to_user. If you start typing bare text, stop and call respond_to_user instead.",
             ]
@@ -513,8 +538,8 @@ async def websocket_endpoint(ws: WebSocket):
                 search_hint = ""
                 if ENABLE_WEB_SEARCH:
                     search_hint = (
-                        " Answer the user; use [Lookup snapshot] when it helps. "
-                        "Finish with respond_to_user only (no bare assistant text)."
+                        " Answer from [Fetched page text] when present (full recipe/steps in speech). "
+                        "Finish with respond_to_user only."
                     )
                     if ENABLE_READ_WEB_PAGE:
                         search_hint += " Use read_web_page only when they need full page text."
@@ -646,8 +671,12 @@ async def websocket_endpoint(ws: WebSocket):
                         else:
                             text_response = _scrub_tracking_urls(_sanitize_parlor_output(raw_text))
                             if not text_response.strip():
-                                # Empty or token-only decode (e.g. <|"|>)—keep conversation history.
+                                # Empty decode often means FC drift after heavy context—reset thread.
                                 text_response = _EMPTY_ASSISTANT_RETRY_MESSAGE
+                                needs_conversation_reset = True
+                                print(
+                                    "Parlor: empty assistant text without tools; resetting conversation"
+                                )
                             elif _looks_like_degenerate_assistant_text(text_response):
                                 print(
                                     "Parlor: degenerate assistant text without tools; resetting conversation"

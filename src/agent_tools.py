@@ -48,9 +48,16 @@ def extract_search_query(args: dict[str, Any]) -> str | None:
 DEFAULT_TIMEOUT_S = float(os.environ.get("PARLOR_HTTP_TIMEOUT", "12"))
 MAX_QUERY_LEN = int(os.environ.get("PARLOR_MAX_SEARCH_QUERY_LEN", "240"))
 MAX_WEB_BODY_BYTES = int(os.environ.get("PARLOR_MAX_WEB_BODY_BYTES", "400000"))
-MAX_COMBINED_SEARCH_CHARS = int(os.environ.get("PARLOR_MAX_WEB_SEARCH_CHARS", "4000"))
+MAX_COMBINED_SEARCH_CHARS = int(os.environ.get("PARLOR_MAX_WEB_SEARCH_CHARS", "14000"))
 MAX_READ_PAGE_CHARS = int(os.environ.get("PARLOR_MAX_READ_PAGE_CHARS", "10000"))
 MAX_PAGE_URL_LEN = int(os.environ.get("PARLOR_MAX_PAGE_URL_LEN", "2048"))
+# After search, fetch top result page(s) as plain text so the model can answer with substance (recipes, etc.).
+SEARCH_AUTO_FETCH_PAGES = int(os.environ.get("PARLOR_SEARCH_AUTO_FETCH_PAGES", "1"))
+SEARCH_AUTO_FETCH_TOTAL_CHARS = int(os.environ.get("PARLOR_SEARCH_AUTO_FETCH_TOTAL_CHARS", "9000"))
+
+_SEARCH_URL_LINE_RE = re.compile(r"^\s*URL:\s*(https?://\S+)", re.MULTILINE | re.IGNORECASE)
+# Server-side memory injection looks for this substring to keep auto-fetched page text when clipping.
+SEARCH_MEMORY_FETCH_ANCHOR = "[Fetched page text for voice"
 
 _USER_AGENT = "Parlor/0.1 (local voice assistant; +https://github.com/fikrikarim/parlor)"
 
@@ -338,11 +345,11 @@ def web_search(
     text: str | None = None,
     question: str | None = None,
 ) -> str:
-    """Find pointers and short snippets on the open web—use often, not only as a last resort.
+    """Find information on the open web. Often includes auto-fetched text from the top result page.
 
-    Call when the user asks about news, weather, events, places, products, or anything to verify.
-    Use short keyword queries; you may call more than once. Paraphrase for the user in speech;
-    do not read backend labels aloud.
+    For recipes, how-tos, and explanations, results usually contain a [Fetched page text] section:
+    turn that into a full spoken answer (ingredients, steps)—do not just list links or say visit a site.
+    Use short keyword queries; you may call more than once. Do not read backend labels aloud.
 
     Args:
         query: Main search string (preferred). Same meaning as q, topic, or question.
@@ -400,6 +407,7 @@ def web_search(
     out = "\n\n".join(parts).strip()
     if not out:
         return "No useful results for that query. Try different keywords."
+    out = _append_auto_fetched_page_sections(out)
     if len(out) > MAX_COMBINED_SEARCH_CHARS:
         return out[: MAX_COMBINED_SEARCH_CHARS - 20] + "\n…[truncated]"
     return out
@@ -421,6 +429,110 @@ def _strip_html_to_text(html: str, max_chars: int) -> str:
         cut = t[: max_chars - 40].rsplit(" ", 1)[0]
         t = cut + "\n…[truncated]"
     return t
+
+
+def _urls_from_search_blob(text: str, limit: int) -> list[str]:
+    """Ordered https URLs from 'URL: …' lines in search output."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for m in _SEARCH_URL_LINE_RE.finditer(text):
+        raw = m.group(1).rstrip(").,;]\"'")
+        u = normalize_user_url(raw)
+        if not u or u in seen:
+            continue
+        if not url_is_allowed_for_fetch(u):
+            continue
+        seen.add(u)
+        out.append(u)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _fetch_public_page_plain(url: str, max_chars: int) -> tuple[str, str] | None:
+    """Download one page and return (title, plain_text) or None on failure."""
+    u = normalize_user_url(url)
+    if len(u) > MAX_PAGE_URL_LEN or not url_is_allowed_for_fetch(u):
+        return None
+    try:
+        req = urllib.request.Request(
+            u,
+            headers={
+                "User-Agent": _USER_AGENT,
+                "Accept": "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.5",
+            },
+            method="GET",
+        )
+        with urllib.request.urlopen(req, timeout=DEFAULT_TIMEOUT_S) as resp:
+            ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            body = resp.read(MAX_WEB_BODY_BYTES)
+    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError):
+        return None
+    try:
+        text_body = body.decode("utf-8", errors="replace")
+    except Exception:
+        text_body = body.decode("latin-1", errors="replace")
+
+    title = ""
+    if "json" in ctype:
+        try:
+            j = json.loads(text_body)
+            main = json.dumps(j, ensure_ascii=False, indent=2)
+        except json.JSONDecodeError:
+            main = text_body
+    elif "html" in ctype or not ctype or ctype == "application/octet-stream":
+        title = _html_page_title(text_body)
+        main = _strip_html_to_text(text_body, max_chars)
+    else:
+        main = text_body.strip()[:max_chars]
+
+    main = (main or "").strip()
+    if len(main) > max_chars:
+        main = main[: max_chars - 30].rsplit(" ", 1)[0] + "\n…[truncated]"
+    if not main:
+        return None
+    return (title.strip(), main)
+
+
+def _append_auto_fetched_page_sections(search_output: str) -> str:
+    """Attach plain text from the first successful search-hit URL(s) for voice-friendly answers."""
+    n = SEARCH_AUTO_FETCH_PAGES
+    if n <= 0:
+        return search_output
+    candidates = _urls_from_search_blob(search_output, max(n * 4, 6))
+    if not candidates:
+        return search_output
+    total_budget = max(2000, SEARCH_AUTO_FETCH_TOTAL_CHARS)
+    per_page = max(2000, total_budget // max(n, 1))
+    blocks: list[str] = []
+    used = 0
+    for u in candidates:
+        if len(blocks) >= n:
+            break
+        remain = total_budget - used
+        if remain < 1200:
+            break
+        got = _fetch_public_page_plain(u, min(per_page, remain))
+        if not got:
+            continue
+        title, body = got
+        host = urllib.parse.urlparse(u).netloc or "source"
+        head = f"[Page text: {host}"
+        if title:
+            head += f" — {title[:120]}"
+        head += "]\n"
+        block = head + body + "\n"
+        blocks.append(block)
+        used += len(block)
+    if not blocks:
+        return search_output
+    return (
+        search_output
+        + "\n\n---\n[Fetched page text for voice — READ THIS: give the user the actual content "
+        "in speech (ingredients, steps, facts). Do not answer with links or 'go to this site' only. "
+        "URLs in the block above are for your reference, not for reading aloud.]\n"
+        + "\n".join(blocks)
+    )
 
 
 def read_web_page(
@@ -462,49 +574,14 @@ def read_web_page(
             "That link cannot be opened from here (blocked for safety). "
             "Use a normal public https page from your earlier results or the user."
         )
-    try:
-        req = urllib.request.Request(
-            u,
-            headers={
-                "User-Agent": _USER_AGENT,
-                "Accept": "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.5",
-            },
-            method="GET",
+    got = _fetch_public_page_plain(u, MAX_READ_PAGE_CHARS)
+    if got is None:
+        return (
+            "Could not load that page (network or HTTP error). Try another link or summarize from "
+            "snippets only."
         )
-        with urllib.request.urlopen(req, timeout=DEFAULT_TIMEOUT_S) as resp:
-            ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
-            body = resp.read(MAX_WEB_BODY_BYTES)
-    except urllib.error.HTTPError as e:
-        return f"The server returned HTTP {e.code} for that page. Try another link or summarize from snippets only."
-    except urllib.error.URLError as e:
-        return f"Could not load the page ({e.reason!r}). Check the URL or try a different result."
-    except (TimeoutError, OSError) as e:
-        return f"Loading the page failed ({e}). Try again or use another URL."
-
-    try:
-        text_body = body.decode("utf-8", errors="replace")
-    except Exception:
-        text_body = body.decode("latin-1", errors="replace")
-
-    title = ""
-    main: str
-    if "json" in ctype:
-        try:
-            j = json.loads(text_body)
-            main = json.dumps(j, ensure_ascii=False, indent=2)
-        except json.JSONDecodeError:
-            main = text_body
-    elif "html" in ctype or not ctype or ctype == "application/octet-stream":
-        title = _html_page_title(text_body)
-        main = _strip_html_to_text(text_body, MAX_READ_PAGE_CHARS)
-    else:
-        main = text_body
-
-    main = main.strip()
-    if len(main) > MAX_READ_PAGE_CHARS:
-        main = main[: MAX_READ_PAGE_CHARS - 30] + "\n…[truncated]"
-
-    if not main:
+    title, main = got
+    if not main.strip():
         return "The page had almost no readable text (maybe scripts-only or empty). Try another URL."
 
     head = (
