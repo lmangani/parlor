@@ -25,6 +25,8 @@
     --c-speak-dim: rgba(129,140,248,0.12);
     --c-loading: #3a3d46;
     --c-loading-dim: rgba(58,61,70,0.12);
+    --c-paused: #6b7280;
+    --c-paused-dim: rgba(107,114,128,0.12);
 
     /* Active state (set by JS) */
     --glow: var(--c-loading);
@@ -241,6 +243,11 @@
   .viewport-wrap.loading::after { animation-duration: 6s; opacity: 0.2; }
   .viewport-wrap.loading .viewport-glow { animation-duration: 7s; opacity: 0.1; }
 
+  /* State: paused — muted, slow breathe */
+  .viewport-wrap.paused::before { animation-duration: 4s; opacity: 0.35; }
+  .viewport-wrap.paused::after { animation-duration: 5s; opacity: 0.25; }
+  .viewport-wrap.paused .viewport-glow { animation-duration: 6s; opacity: 0.12; }
+
   video {
     display: block;
     width: 100%;
@@ -405,6 +412,7 @@
   .state-indicator .dot.processing { animation: dot-pulse 0.6s ease-in-out infinite; }
   .state-indicator .dot.speaking { animation: dot-pulse 1s ease-in-out infinite; }
   .state-indicator .dot.loading { animation: dot-pulse 2.5s ease-in-out infinite; }
+  .state-indicator .dot.paused { animation: dot-pulse 3s ease-in-out infinite; opacity: 0.65; }
 
   @keyframes dot-pulse {
     0%, 100% { opacity: 1; transform: scale(1); }
@@ -442,6 +450,7 @@
   <!-- Controls -->
   <div class="controls">
     <button id="cameraToggle" class="ctrl-btn active">Camera On</button>
+    <button id="pauseBtn" type="button" class="ctrl-btn">Pause</button>
     <div class="state-indicator">
       <div id="stateDot" class="dot loading"></div>
       <span id="stateText">Loading...</span>
@@ -457,7 +466,7 @@
 <script src="https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.29/dist/bundle.min.js"></script>
 <script>
 const $ = id => document.getElementById(id);
-const video = $('video'), cameraToggle = $('cameraToggle');
+const video = $('video'), cameraToggle = $('cameraToggle'), pauseBtn = $('pauseBtn');
 const messagesDiv = $('messages'), statusEl = $('status');
 const stateDot = $('stateDot'), stateText = $('stateText');
 const viewportWrap = $('viewportWrap');
@@ -492,7 +501,7 @@ function initWaveformCanvas() {
 }
 
 function getStateColor() {
-  const colors = { listening: '#4ade80', processing: '#f59e0b', speaking: '#818cf8', loading: '#3a3d46' };
+  const colors = { listening: '#4ade80', processing: '#f59e0b', speaking: '#818cf8', loading: '#3a3d46', paused: '#6b7280' };
   return colors[state] || colors.loading;
 }
 
@@ -567,8 +576,18 @@ function setState(newState) {
 
   // Update state indicator
   stateDot.className = `dot ${newState}`;
-  const labels = { loading: 'Loading...', listening: 'Listening', processing: 'Thinking...', speaking: 'Speaking' };
+  const labels = { loading: 'Loading...', listening: 'Listening', processing: 'Thinking...', speaking: 'Speaking', paused: 'Paused' };
   stateText.textContent = labels[newState] || newState;
+
+  if (pauseBtn) {
+    if (newState === 'paused') {
+      pauseBtn.textContent = 'Resume';
+      pauseBtn.classList.add('active');
+    } else if (newState === 'listening') {
+      pauseBtn.textContent = 'Pause';
+      pauseBtn.classList.remove('active');
+    }
+  }
 
   // Update viewport glow class
   viewportWrap.className = `viewport-wrap ${newState}`;
@@ -585,6 +604,7 @@ function setState(newState) {
     processing: ['#f59e0b', 'rgba(245,158,11,0.12)'],
     speaking: ['#818cf8', 'rgba(129,140,248,0.12)'],
     loading: ['#3a3d46', 'rgba(58,61,70,0.12)'],
+    paused: ['#6b7280', 'rgba(107,114,128,0.12)'],
   };
   const [glow, glowDim] = stateVars[newState] || stateVars.loading;
   document.documentElement.style.setProperty('--glow', glow);
@@ -823,6 +843,14 @@ cameraToggle.addEventListener('click', () => {
   cameraToggle.classList.toggle('active', cameraEnabled);
   cameraToggle.textContent = cameraEnabled ? 'Camera On' : 'Camera Off';
   video.style.opacity = cameraEnabled ? 1 : 0.3;
+});
+
+pauseBtn.addEventListener('click', () => {
+  if (state === 'listening') {
+    setState('paused');
+  } else if (state === 'paused') {
+    setState('listening');
+  }
 });
 
 // ── Init ──

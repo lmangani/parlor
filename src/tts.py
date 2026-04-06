@@ -34,6 +34,8 @@ class MLXBackend(TTSBackend):
 
     def generate(self, text: str, voice: str = "af_heart", speed: float = 1.1) -> np.ndarray:
         results = list(self._model.generate(text=text, voice=voice, speed=speed))
+        if not results:
+            return np.array([])
         return np.concatenate([np.array(r.audio) for r in results])
 
 
