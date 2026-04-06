@@ -97,6 +97,37 @@ def _normalize_result_url(href: str) -> str:
     return h
 
 
+def url_is_safe_for_user(url: str) -> bool:
+    """Drop sponsored / tracking DuckDuckGo and ad redirects from user-visible results."""
+    u = (url or "").strip()
+    if not u:
+        return False
+    low = u.lower()
+    if not low.startswith(("http://", "https://")):
+        return False
+    bad_fragments = (
+        "duckduckgo.com/y.js",
+        "/y.js?",
+        "ad_provider=",
+        "ad_domain=",
+        "ad_type=",
+        "bing.com/aclick",
+        "googleadservices",
+        "doubleclick.net",
+        "pagead2.googlesyndication",
+    )
+    if any(b in low for b in bad_fragments):
+        return False
+    try:
+        p = urllib.parse.urlparse(low)
+    except ValueError:
+        return False
+    host = p.netloc or ""
+    if host.endswith("duckduckgo.com") and p.path.rstrip("/").endswith("y.js"):
+        return False
+    return True
+
+
 def _add_source(
     sources: list[dict[str, str]],
     seen_urls: set[str],
@@ -106,6 +137,8 @@ def _add_source(
     u = _normalize_result_url(url).strip()
     t = (title or "").strip()
     if not u or u in seen_urls:
+        return
+    if not url_is_safe_for_user(u):
         return
     if not t:
         t = u[:80]
@@ -157,6 +190,8 @@ def _duckduckgo_html_with_sources(
         if len(title) < 3 or title in seen_titles:
             continue
         norm = _normalize_result_url(href)
+        if not url_is_safe_for_user(norm):
+            continue
         _add_source(sources, seen_urls, title, href)
         seen_titles.add(title)
         lines.append(f"{len(lines) + 1}. {title}\n   URL: {norm}")
@@ -174,6 +209,8 @@ def _duckduckgo_html_with_sources(
                 if len(title) < 3 or title in seen_titles:
                     continue
                 norm = _normalize_result_url(href)
+                if not url_is_safe_for_user(norm):
+                    continue
                 _add_source(sources, seen_urls, title, href)
                 seen_titles.add(title)
                 lines.append(f"{len(lines) + 1}. {title}\n   URL: {norm}")

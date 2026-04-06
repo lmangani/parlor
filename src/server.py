@@ -18,6 +18,7 @@ from fastapi.responses import HTMLResponse
 
 import litert_lm
 import tts
+import agent_tools
 from tools_policy import ParlorToolPolicy, build_optional_tools
 
 HF_REPO = "litert-community/gemma-4-E2B-it-litert-lm"
@@ -87,6 +88,8 @@ def build_system_prompt() -> str:
             "anything too dense for voice. The user reads this while or after hearing response.",
             "  Use display_context whenever tools returned detail worth keeping (especially web_search). "
             "You may speak a brief overview in response and put the full breakdown in display_context.",
+            "  Never put tool syntax in response or display_context (no <|tool_call, no call:respond_to_user{, "
+            "no Gemma markup)—only natural language. Tools are invoked by the runtime, not typed out.",
             "",
         ]
     )
@@ -168,6 +171,55 @@ def _strip_model_text(s: str | None) -> str:
     return str(s or "").replace('<|"|>', "").strip()
 
 
+def _looks_like_leaked_tool_output(s: str | None) -> bool:
+    if not s or not str(s).strip():
+        return False
+    t = str(s)
+    needles = (
+        "<|tool_call",
+        "<tool_call",
+        "call:respond_to_user",
+        "<|turn|>",
+        "<|channel|>",
+        "display_context:<|",
+        "<tool_response",
+    )
+    return any(n in t for n in needles)
+
+
+def _sanitize_parlor_output(s: str | None) -> str:
+    """Strip Gemma/LiteRT tool fragments so they are never shown or spoken."""
+    if not s:
+        return ""
+    t = _strip_model_text(s)
+    cut = t.find("<|tool_call")
+    if cut != -1:
+        t = t[:cut].rstrip()
+    cut = t.find("call:respond_to_user{")
+    if cut != -1:
+        t = t[:cut].rstrip()
+    t = re.sub(r"<\|[^|]*\|>", "", t)
+    t = re.sub(r"<tool_call[^>]*>", "", t, flags=re.I)
+    t = re.sub(r"</?tool_call\|?>", "", t, flags=re.I)
+    return t.strip()
+
+
+def _scrub_tracking_urls(s: str) -> str:
+    """Remove ad/tracking URLs the model may have echoed (never speak or show these)."""
+
+    def repl(m: re.Match[str]) -> str:
+        raw = m.group(0)
+        u = raw.rstrip(").,;]\"'")
+        return raw if agent_tools.url_is_safe_for_user(u) else ""
+
+    return re.sub(r"https?://[^\s<>'\"]+", repl, s)
+
+
+_CONVERSATION_RESET_MESSAGE = (
+    "I hit a snag formatting that answer. Let's continue—what would you like to know?"
+)
+
+
 @app.get("/")
 async def root():
     return HTMLResponse(content=(Path(__file__).parent / "index.html").read_text())
@@ -214,6 +266,19 @@ async def websocket_endpoint(ws: WebSocket):
         tool_event_handler=tool_policy,
     )
     conversation.__enter__()
+
+    def reopen_conversation() -> None:
+        nonlocal conversation
+        try:
+            conversation.__exit__(None, None, None)
+        except Exception as ex:
+            print(f"Parlor: conversation __exit__ during reset: {ex}")
+        conversation = engine.create_conversation(
+            messages=[{"role": "system", "content": SYSTEM_PROMPT}],
+            tools=tool_functions,
+            tool_event_handler=tool_policy,
+        )
+        conversation.__enter__()
 
     interrupted = asyncio.Event()
     msg_queue = asyncio.Queue()
@@ -307,22 +372,52 @@ async def websocket_endpoint(ws: WebSocket):
 
                 # Extract response from tool call or fallback to raw text
                 skip_audio = False
+                display_ctx = ""
+                transcription = None
+                needs_conversation_reset = False
+
                 if tool_result:
                     transcription = _strip_model_text(tool_result.get("transcription", ""))
+                    if _looks_like_leaked_tool_output(transcription):
+                        transcription = ""
+
                     spoken_raw = _strip_model_text(tool_result.get("response", ""))
                     display_ctx = _strip_model_text(tool_result.get("display_context", ""))
-                    # Voice-only empty + on-screen detail => no TTS (read the transcript).
-                    skip_audio = not spoken_raw and bool(display_ctx)
-                    text_response = spoken_raw
+                    if _looks_like_leaked_tool_output(spoken_raw):
+                        spoken_raw = ""
+                    if _looks_like_leaked_tool_output(display_ctx):
+                        display_ctx = ""
+
+                    text_response = _scrub_tracking_urls(_sanitize_parlor_output(spoken_raw))
+                    display_ctx = _scrub_tracking_urls(_sanitize_parlor_output(display_ctx))
+
+                    if not text_response and not display_ctx:
+                        needs_conversation_reset = True
+                        text_response = _CONVERSATION_RESET_MESSAGE
+                        skip_audio = False
+                    else:
+                        skip_audio = not text_response and bool(display_ctx)
+
                     print(
                         f"LLM ({llm_time:.2f}s) [tool] heard: {transcription!r} → "
                         f"spoken={text_response[:120]!r} display_len={len(display_ctx)} "
                         f"skip_audio={skip_audio}"
                     )
                 else:
-                    transcription = None
-                    text_response = response["content"][0]["text"]
-                    print(f"LLM ({llm_time:.2f}s) [no tool]: {text_response}")
+                    raw_text = response["content"][0]["text"]
+                    if _looks_like_leaked_tool_output(raw_text):
+                        print("Parlor: leaked tool syntax in assistant text; resetting conversation")
+                        needs_conversation_reset = True
+                        text_response = _CONVERSATION_RESET_MESSAGE
+                    else:
+                        text_response = _scrub_tracking_urls(_sanitize_parlor_output(raw_text))
+                        if not text_response.strip():
+                            needs_conversation_reset = True
+                            text_response = _CONVERSATION_RESET_MESSAGE
+                    print(f"LLM ({llm_time:.2f}s) [no tool] raw head: {raw_text[:160]!r}…")
+
+                if needs_conversation_reset:
+                    reopen_conversation()
 
                 if interrupted.is_set():
                     print("Interrupted after LLM, skipping response")
@@ -331,9 +426,8 @@ async def websocket_endpoint(ws: WebSocket):
                 reply = {"type": "text", "text": text_response, "llm_time": round(llm_time, 2)}
                 if transcription:
                     reply["transcription"] = transcription
-                dc = _strip_model_text(tool_result.get("display_context", ""))
-                if dc:
-                    reply["display_context"] = dc
+                if display_ctx:
+                    reply["display_context"] = display_ctx
                 if skip_audio:
                     reply["skip_audio"] = True
                 if tool_trace:
